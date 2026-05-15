@@ -672,6 +672,61 @@ def test_contact_sensor_filter_link_idx(show_viewer):
     assert filtered_data[1], "Contact sensor with filter_link_idx should still detect contact with the box"
 
 
+@pytest.mark.required
+def test_contact_force_sensor_filter_link_idx(show_viewer, tol):
+    """ContactForce sensor filter_link_idx drops the force contributed by contacts with listed links."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=(0.0, 0.0, -10.0),
+        ),
+        profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+        show_viewer=show_viewer,
+    )
+    floor = scene.add_entity(morph=gs.morphs.Plane())
+    box_on_floor = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.2, 0.2, 0.2),
+            pos=(0.0, 0.0, 0.1),
+        ),
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.2, 0.2, 0.2),
+            pos=(0.0, 0.5, 0.1),
+        ),
+    )
+    sensor = scene.add_sensor(
+        gs.sensors.ContactForce(
+            entity_idx=box_on_floor.idx,
+        )
+    )
+    sensor_filtered = scene.add_sensor(
+        gs.sensors.ContactForce(
+            entity_idx=box_on_floor.idx,
+            filter_link_idx=(floor.link_start,),
+        )
+    )
+    scene.build(n_envs=2)
+    box.set_pos(
+        (
+            (0.0, 0.5, 0.1),  # box not touching box_on_floor
+            (0.0, 0.0, 0.3),  # box on top of box_on_floor
+        )
+    )
+    for _ in range(20):  # make sure the boxes are stably resting
+        scene.step()
+    force = sensor.read()
+    force_filtered = sensor_filtered.read()
+    # env 0: box_on_floor only touches the floor.
+    assert torch.linalg.norm(force[0]) > 1.0, "ContactForce should report the floor support force"
+    assert force[0][2] > 1.0, "the floor pushes box_on_floor up (+z)"
+    assert torch.linalg.norm(force_filtered[0]) < tol, "filtering the floor (the only contact) leaves zero force"
+    # env 1: box_on_floor touches the floor (below) and the box (above).
+    assert torch.linalg.norm(force[1]) > 1.0, "ContactForce should report a non-zero net contact force"
+    assert force_filtered[1][2] < -1.0, "filtering the floor leaves only the box-on-top contact, which pushes down (-z)"
+    assert not torch.allclose(force[1], force_filtered[1], atol=tol), "filtering the floor should change the result"
+
+
 # ------------------------------------------------------------------------------------------
 # ------------------------------------ Raycast Sensors -------------------------------------
 # ------------------------------------------------------------------------------------------
