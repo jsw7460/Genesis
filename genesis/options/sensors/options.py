@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Annotated, Any, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, NamedTuple, Sequence, TypeVar
 
 import numpy as np
 from pydantic import BeforeValidator, Field, StrictBool, StrictInt, field_validator
@@ -12,11 +12,14 @@ from genesis.typing import (
     NonNegativeFloat,
     NonNegativeInt,
     OptionalIArrayType,
+    PositiveFArrayType,
     PositiveFloat,
     PositiveVec3IType,
     RotationMatrixType,
     UnitIntervalVec3Type,
     UnitIntervalVec4Type,
+    UnitVec3FArrayType,
+    UnitVec3FType,
     Vec2FType,
     Vec3FArrayType,
     Vec3FType,
@@ -32,8 +35,8 @@ if TYPE_CHECKING:
     from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.sensors.contact_force import ContactForceSensor, ContactSensor
     from genesis.engine.sensors.imu import IMUSensor
-    from genesis.engine.sensors.proximity import ProximitySensor
     from genesis.engine.sensors.raycaster import RaycasterSensor
+    from genesis.engine.sensors.surface_distance_probe import SurfaceDistanceProbeSensor
 
     NonNegativeUnboundedFloat = float
     LaxNonNegativeUnboundedVec3FType = Vec3FType | float
@@ -48,6 +51,14 @@ CrossCouplingAxisType = RotationMatrixType | UnitIntervalVec3Type | float
 
 
 SensorT = TypeVar("SensorT", bound="Sensor")
+
+
+def _check_len_match(value, expected_len: int, name: str, ref_name: str):
+    if isinstance(value, Sequence) and len(value) != expected_len:
+        gs.raise_exception(
+            f"{name} must have the same length as {ref_name} when {name} is array-like. "
+            f"Got {len(value)} {name} and {expected_len} {ref_name}."
+        )
 
 
 class SensorOptions(Options, Generic[SensorT]):
@@ -65,11 +76,8 @@ class SensorOptions(Options, Generic[SensorT]):
     delay : float, optional
         The read delay time in seconds. Data read will be outdated by this amount. Defaults to 0.0 (no delay).
     jitter : float, optional
-        The jitter in seconds modeled as a random additive delay sampled from a normal distribution.
-        Jitter cannot be greater than delay. `interpolate` should be True when `jitter` is greater than 0.
-    interpolate : bool, optional
-        If True, the sensor data is interpolated between data points for delay + jitter.
-        Otherwise, the sensor data at the closest time step will be used. Default is False.
+        The jitter in seconds modeled as a random additive delay sampled uniformly in ``[0, jitter)`` each step.
+        Jitter cannot be greater than delay.
     draw_debug : bool
         If True and visualizer is active, the sensor will draw debug shapes in the scene. Defaults to False.
     """
@@ -77,7 +85,6 @@ class SensorOptions(Options, Generic[SensorT]):
     history_length: NonNegativeInt = 0
     delay: NonNegativeFloat = 0.0
     jitter: NonNegativeFloat = 0.0
-    interpolate: StrictBool = False
     draw_debug: StrictBool = False
     # -1 means not link-attached. None is accepted from users and normalized to -1 so SensorManager can sort uniformly.
     entity_idx: StrictInt = Field(default=-1, ge=-1)
@@ -88,8 +95,6 @@ class SensorOptions(Options, Generic[SensorT]):
         return -1 if value is None else value
 
     def model_post_init(self, context: Any) -> None:
-        if self.jitter > 0 and not self.interpolate:
-            gs.raise_exception(f"{type(self).__name__}: `interpolate` should be True when `jitter` is greater than 0.")
         if self.jitter > self.delay:
             gs.raise_exception(f"{type(self).__name__}: Jitter must be less than or equal to read delay.")
 
@@ -188,6 +193,51 @@ class SimpleSensorOptions(SensorOptions[SensorT]):
     bias: FArrayType | float = 0.0
     noise: FArrayType | float = 0.0
     random_walk: FArrayType | float = 0.0
+
+
+class ProbeSensorOptionsMixin(SensorOptions[SensorT]):
+    """
+    Base options class for sensors that use local probe points.
+
+    Parameters
+    ----------
+    probe_local_pos : array-like[array-like[float, float, float]]
+        Probe positions in link-local frame. One ``(x, y, z)`` per probe.
+    probe_radius : float | array-like[float]
+        Probe sensing radius in meters. A scalar is shared by every probe; an array must match the probe count.
+    probe_radius_noise : float
+        Additive radius noise in meters used by kernels whose measured branch depends on effective probe radius.
+    debug_probe_color : array-like[float, float, float, float]
+        RGBA color for inactive debug probe spheres.
+    """
+
+    probe_local_pos: Vec3FArrayType = ((0.0, 0.0, 0.0),)
+    probe_radius: PositiveFArrayType | PositiveFloat = 0.01
+    probe_radius_noise: NonNegativeFloat = 0.0
+    debug_probe_color: UnitIntervalVec4Type = (0.2, 0.6, 1.0, 0.6)
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        n_probes = np.array(self.probe_local_pos).reshape(-1, 3).shape[0]
+        _check_len_match(self.probe_radius, n_probes, "probe_radius", "probe_local_pos")
+
+
+class ProbesWithNormalSensorOptionsMixin(ProbeSensorOptionsMixin[SensorT]):
+    """
+    Probe options for sensors that also define one normal per probe, or one shared normal.
+    """
+
+    probe_local_normal: UnitVec3FArrayType | UnitVec3FType = (0.0, 0.0, 1.0)
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        n_probes = np.array(self.probe_local_pos).reshape(-1, 3).shape[0]
+        normals = np.array(self.probe_local_normal)
+        if normals.ndim > 1 and normals.reshape(-1, 3).shape[0] != n_probes:
+            gs.raise_exception(
+                "probe_local_normal must be one normal or match probe_local_pos length. "
+                f"Got {normals.reshape(-1, 3).shape[0]} normals and {n_probes} probe positions."
+            )
 
 
 class Contact(RigidSensorOptionsMixin["ContactSensor"], SimpleSensorOptions["ContactSensor"]):
@@ -438,9 +488,13 @@ class IMU(RigidSensorOptionsMixin["IMUSensor"], SimpleSensorOptions["IMUSensor"]
         self.noise = self.acc_noise + self.gyro_noise + self.mag_noise
 
 
-class Proximity(RigidSensorOptionsMixin["ProximitySensor"], SimpleSensorOptions["ProximitySensor"]):
+class SurfaceDistanceProbe(
+    RigidSensorOptionsMixin["SurfaceDistanceProbeSensor"],
+    SimpleSensorOptions["SurfaceDistanceProbeSensor"],
+    ProbeSensorOptionsMixin["SurfaceDistanceProbeSensor"],
+):
     """
-    Proximity sensor that reports the nearest distances from probe positions to tracked mesh surfaces.
+    Surface distance probe that reports nearest distances from probe positions to tracked mesh surfaces.
     The read() output will provide the distances, and the nearest points can be accessed with `sensor.nearest_points`.
 
     Attached to a rigid entity link. Takes a list of local probe positions and a list of global link indices
@@ -452,30 +506,28 @@ class Proximity(RigidSensorOptionsMixin["ProximitySensor"], SimpleSensorOptions[
     ----------
     probe_local_pos : array-like[array-like[float, float, float]]
         Probe positions in link-local frame. One (x, y, z) per probe.
+    probe_radius : float | array-like[float]
+        Maximum sensing range in meters. When no mesh is within this distance, distance is clamped to the probe
+        radius and nearest points is the probe position. Default: 10.0.
     track_link_idx : array-like[int]
         Global link indices (solver link space) whose mesh geoms are used for distance queries.
-    max_range : float
-        Maximum reporting range in meters. When no mesh is within this distance, distance is
-        clamped to max_range and nearest points is the probe position. Default: 10.0.
     debug_sphere_radius: float, optional
         The radius of each debug sphere drawn in the scene. Defaults to 0.008.
-    debug_color: array-like[float, float, float, float], optional
-        The rgba color of the debug sphere. Defaults to (0.2, 0.6, 1.0, 0.6).
     """
 
-    probe_local_pos: Vec3FArrayType = [(0.0, 0.0, 0.0)]
+    probe_radius: PositiveFArrayType | PositiveFloat = 10.0
     track_link_idx: IArrayType = Field(default_factory=tuple)
-    max_range: PositiveFloat = 10.0
 
     debug_sphere_radius: PositiveFloat = 0.008
-    debug_color: UnitIntervalVec4Type = (0.2, 0.6, 1.0, 0.6)
 
     def validate_scene(self, scene: "Scene"):
         super().validate_scene(scene)
         n_links = scene.sim.rigid_solver.n_links
         for i, link_idx in enumerate(self.track_link_idx):
             if not (0 <= link_idx < n_links):
-                gs.raise_exception(f"Proximity sensor track_link_idx[{i}]={link_idx} is out of range [0, {n_links}).")
+                gs.raise_exception(
+                    f"SurfaceDistanceProbe track_link_idx[{i}]={link_idx} is out of range [0, {n_links})."
+                )
 
 
 class Raycaster(KinematicSensorOptionsMixin["RaycasterSensor"], SimpleSensorOptions["RaycasterSensor"]):

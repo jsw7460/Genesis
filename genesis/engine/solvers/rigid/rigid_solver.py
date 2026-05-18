@@ -394,12 +394,33 @@ class RigidSolver(KinematicSolver):
             cores_per_unit = 64 if torch.version.hip else 128
             gpu_cores = gpu_props.multi_processor_count * cores_per_unit
         elif gs.backend == gs.metal:
-            # Upper-bound estimate for Apple Silicon: 40 GPU cores × 128 ALUs
+            # Upper-bound estimate for Apple Silicon: 40 GPU cores * 128 ALUs
             gpu_cores = 5120
         else:
             # Fallback for other GPU backends (e.g. Vulkan)
             gpu_cores = 16384
         return self.n_envs <= gpu_cores
+
+    def _should_transpose_constraint_layout(self) -> bool:
+        """Decide whether to allocate the layout-flippable constraint-state with layout=(1, 0).
+
+        The transposed layout (plus its companion cooperative kernels) wins on workloads with enough per-env compute
+        density to amortize the warp-per-env overhead, and loses when envs are sparse and many: in those cases the
+        legacy 1-thread-per-env path is already coalesced under (len_constraints_, _B) and warp scheduling dominates.
+
+        Empirical pattern from `perso_hugh/doc/linesearch_shuffle.md` (Exp 5):
+          - Wins (>+3%): dex_hand, g1_fall, box_pyramid_3..6; all 4096 envs, n_dofs >= ~18.
+          - Wash / regression: anymal/franka families; 30000 envs, n_dofs <= ~12.
+
+        Heuristic: enable transpose when both (a) n_envs is small enough that env-parallelism does not already
+        saturate the GPU, and (b) per-env DoF count is large enough to keep a 32-lane warp busy on the cooperative
+        reductions.
+        """
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False
+        n_envs = self._sim._B
+        n_dofs = self.n_dofs
+        return n_envs <= 8192 and n_dofs >= 16
 
     def _build_static_config(self):
         static_rigid_sim_config = dict(
@@ -421,6 +442,7 @@ class RigidSolver(KinematicSolver):
             solver_type=self._options.constraint_solver,
             broadphase_traversal=self._resolve_broadphase_traversal(),
             parallel_init=self._should_use_parallel_init(),
+            constraint_layout_transposed=self._should_transpose_constraint_layout(),
         )
 
         # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
@@ -1570,8 +1592,6 @@ class RigidSolver(KinematicSolver):
                 mass_dst[envs_idx] = state.mass_shift[envs_idx]
                 if self.n_geoms:
                     fric_dst[envs_idx] = state.friction_ratio[envs_idx]
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             envs_idx = self._scene._sanitize_envs_idx(envs_idx)
             kernel_set_zero(envs_idx, self._errno)
@@ -1698,8 +1718,6 @@ class RigidSolver(KinematicSolver):
                 target = data[:, link.q_start : link.q_start + 3]
             pos = broadcast_tensor(pos, gs.tc_float, target.shape)
             torch.where(envs_idx[:, None], pos, target, out=target)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             pos, links_idx, envs_idx = self._sanitize_io_variables(
                 pos, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
@@ -1797,8 +1815,6 @@ class RigidSolver(KinematicSolver):
                 target = data[:, link.q_start + 3 : link.q_start + 7]
             quat = broadcast_tensor(quat, gs.tc_float, target.shape)
             torch.where(envs_idx[:, None], quat, target, out=target)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             quat, links_idx, envs_idx = self._sanitize_io_variables(
                 quat, links_idx, self.n_links, "links_idx", envs_idx, (4,), skip_allocation=True
@@ -1917,8 +1933,6 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(mass_data, mask, mass_data[mask] * ratio_t)
             assign_indexed_tensor(inertial_i_data, mask, inertial_i_data[mask] * ratio_t[..., None, None])
             assign_indexed_tensor(invweight_data, mask, invweight_data[mask] / ratio_t[..., None])
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         ratio, links_idx, envs_idx = self._sanitize_io_variables(
@@ -1973,8 +1987,6 @@ class RigidSolver(KinematicSolver):
                 errno[envs_idx] = 0
                 if mask and isinstance(mask[0], torch.Tensor):
                     envs_idx = mask[0].reshape((-1,))
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             qpos, qs_idx, envs_idx = self._sanitize_io_variables(
                 qpos, qs_idx, self.n_qs, "qs_idx", envs_idx, skip_allocation=True
@@ -2118,8 +2130,6 @@ class RigidSolver(KinematicSolver):
                 num_values = len(tensor_list)
                 for j, mask_j in enumerate(((*mask, ..., j) for j in range(num_values)) if num_values > 1 else (mask,)):
                     assign_indexed_tensor(data, mask_j, tensor_list[j])
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         tensor_list = list(tensor_list)
@@ -2221,8 +2231,6 @@ class RigidSolver(KinematicSolver):
         if gs.use_zerocopy:
             errno = qd_to_torch(self._errno, copy=False)
             errno[envs_idx] = 0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             kernel_set_zero(envs_idx, self._errno)
 
@@ -2250,8 +2258,6 @@ class RigidSolver(KinematicSolver):
             ctrl_mode[mask] = gs.CTRL_MODE.FORCE
             ctrl_force = qd_to_torch(self.dofs_state.ctrl_force, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_force, mask, force)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         force, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2271,8 +2277,6 @@ class RigidSolver(KinematicSolver):
             ctrl_pos[mask] = 0.0
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         velocity, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2292,8 +2296,6 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             ctrl_vel[mask] = 0.0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         position, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2313,8 +2315,6 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         position, dofs_idx, _ = self._sanitize_io_variables(
@@ -2650,8 +2650,6 @@ class RigidSolver(KinematicSolver):
             for tensor in (self.links_state.cfrc_applied_ang, self.links_state.cfrc_applied_vel):
                 out = qd_to_torch(tensor, copy=False)
                 out.zero_()
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         kernel_clear_external_force(self.links_state, self._rigid_global_info, self._static_rigid_sim_config)
