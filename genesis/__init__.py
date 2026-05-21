@@ -255,21 +255,6 @@ def init(
             random_seed=seed,
         )
 
-    # On Metal, share PyTorch MPS's command queue with Quadrants so that GPU-side ordering is automatic and the
-    # per-interop-point sync overhead (qd.sync / torch.mps.synchronize) is eliminated.
-    if backend == _gs_backend.metal and device.type == "mps":
-        mps_queue = qd.interop.get_mps_command_queue()
-        if not mps_queue:
-            raise_exception(
-                "Failed to extract PyTorch MPS's Metal command queue. This is required on Apple Metal for correct "
-                "GPU synchronisation between Genesis and PyTorch. Please ensure you are using a supported PyTorch "
-                "version (>= 2.0)."
-            )
-        qd_init_kwargs.update(
-            external_metal_command_queue=mps_queue,
-            external_metal_command_queue_is_torch_queue=True,
-        )
-
     # init quadrants
     qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
     with redirect_stdout(_qd_outputs):
@@ -471,12 +456,19 @@ sys.excepthook = _custom_excepthook
 from .ext import _trimesh_patch
 from .utils.misc import get_src_dir as _get_src_dir
 
+# Eagerly load native extensions under redirected stderr to silence dlopen-time noise (e.g. macOS
+# objc duplicate-class warnings when several libraries ship their own copy of GLFW).
 with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
     try:
         from pygel3d import graph, hmesh
     except OSError as e:
         # Import may fail because of missing system dependencies (libGLU.so.1).
         # This is not blocking because it is only an issue for hybrid entities.
+        pass
+
+    try:
+        import imgui_bundle  # noqa: F401
+    except ImportError:
         pass
 
     try:

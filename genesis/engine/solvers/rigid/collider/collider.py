@@ -585,6 +585,8 @@ class Collider:
                 normal.zero_()
             else:
                 normal[:, envs_idx] = 0.0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
@@ -638,6 +640,8 @@ class Collider:
                 pos[:, envs_idx] = 0.0
                 normal[:, envs_idx] = 0.0
                 force[:, envs_idx] = 0.0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         if not isinstance(envs_idx, torch.Tensor):
@@ -771,9 +775,12 @@ class Collider:
             )
         if self._collider_static_config.has_terrain:
             func_narrow_phase_any_vs_terrain(
+                self._solver.links_state,
+                self._solver.links_info,
                 self._solver.geoms_state,
                 self._solver.geoms_info,
                 self._solver.geoms_init_AABB,
+                self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
                 self._collider_state,
                 self._collider_info,
