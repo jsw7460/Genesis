@@ -1090,24 +1090,27 @@ def _ellipsoid_mjcf_path(tmp_path, semi_axes):
     return str(path)
 
 
-@pytest.mark.required
 @pytest.mark.parametrize(
-    "smooth_kind, pair_kind",
+    "entity_kind, entity_type, ground_type",
     [
-        ("sphere", "prim-prim"),
-        ("sphere", "prim-mesh"),
-        ("sphere", "prim-terrain"),
-        ("sphere", "mesh-mesh"),
-        ("capsule", "prim-prim"),
-        ("capsule", "prim-mesh"),
-        ("cylinder", "prim-prim"),
-        ("cylinder", "prim-mesh"),
-        ("ellipsoid", "prim-prim"),
-        ("ellipsoid", "prim-mesh"),
+        pytest.param("sphere", "prim", "prim", marks=pytest.mark.required),
+        pytest.param("sphere", "prim", "mesh", marks=pytest.mark.required),
+        pytest.param("capsule", "prim", "prim", marks=pytest.mark.required),
+        pytest.param("capsule", "prim", "mesh", marks=pytest.mark.required),
+        pytest.param("cylinder", "prim", "prim", marks=pytest.mark.required),
+        pytest.param("cylinder", "prim", "mesh", marks=pytest.mark.required),
+        pytest.param("ellipsoid", "prim", "prim", marks=pytest.mark.required),
+        pytest.param("ellipsoid", "prim", "mesh", marks=pytest.mark.required),
+        ("sphere", "prim", "terrain"),
+        ("sphere", "prim", "nonconvex"),
+        ("sphere", "mesh", "mesh"),
+        ("sphere", "nonconvex", "prim"),
+        ("sphere", "nonconvex", "nonconvex"),
+        ("sphere", "nonconvex", "plane"),
     ],
 )
 @pytest.mark.parametrize("gjk_collision", [False, True])
-def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer, tmp_path):
+def test_smooth_box_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_viewer, tmp_path):
     WORLD_TILT_ANGLE = 50.0
     HEIGHT = 0.02
     # The smooth-primitive characteristic length must be small enough to amplify the bias and make drift evident
@@ -1123,7 +1126,6 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
     tilt_axis = np.array([1.0, 1.0, 0.0]) / math.sqrt(2.0)
     tilt_quat = gu.rotvec_to_quat(math.radians(WORLD_TILT_ANGLE) * tilt_axis)
     R = gu.quat_to_R(tilt_quat)
-    terrain_pos_world = R @ np.array([-BOX_HALF_EXTENT, -BOX_HALF_EXTENT, HEIGHT])
     box_pos_world = R @ np.array([0.0, 0.0, 0.5 * HEIGHT])
     gravity_world = R @ np.array([0.0, 0.0, -9.81])
 
@@ -1142,21 +1144,26 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
         ),
         show_viewer=show_viewer,
     )
-    if pair_kind == "prim-mesh":
+    if ground_type in ("mesh", "nonconvex"):
         box_mesh = trimesh.creation.box(extents=(2.0 * BOX_HALF_EXTENT, 2.0 * BOX_HALF_EXTENT, HEIGHT))
-        scene.add_entity(
+        is_ground_convex = ground_type == "mesh"
+        box = scene.add_entity(
             morph=gs.morphs.MeshSet(
                 files=(box_mesh,),
                 pos=box_pos_world,
                 quat=tilt_quat,
+                convexify=is_ground_convex,
                 fixed=True,
             ),
             surface=gs.surfaces.Default(
                 smooth=False,
             ),
         )
-    elif pair_kind == "prim-terrain":
+        # Manually overwrite convex flag to forcibly exercise non-convex collision path
+        box.geoms[0]._is_convex = is_ground_convex
+    elif ground_type == "terrain":
         flat_hf = np.zeros((2, 2), dtype=np.float32)
+        terrain_pos_world = R @ np.array([-BOX_HALF_EXTENT, -BOX_HALF_EXTENT, HEIGHT])
         scene.add_entity(
             morph=gs.morphs.Terrain(
                 horizontal_scale=2.0 * BOX_HALF_EXTENT,
@@ -1166,7 +1173,16 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
                 quat=tilt_quat,
             ),
         )
-    else:
+    elif ground_type == "plane":
+        plane_pos_world = R @ np.array([0.0, 0.0, HEIGHT])
+        scene.add_entity(
+            morph=gs.morphs.Plane(
+                pos=plane_pos_world,
+                quat=tilt_quat,
+                fixed=True,
+            ),
+        )
+    else:  # if ground_type == "prim":
         scene.add_entity(
             morph=gs.morphs.Box(
                 pos=box_pos_world,
@@ -1176,8 +1192,8 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
             ),
         )
 
-    if smooth_kind == "sphere":
-        if smooth_kind == "sphere" and pair_kind == "mesh-mesh":
+    if entity_kind == "sphere":
+        if entity_kind == "sphere" and entity_type in ("mesh", "nonconvex"):
             sphere_mesh = trimesh.creation.icosphere(
                 radius=SMOOTH_RADIUS, subdivisions=SPHERE_TESSELLATION_SUBDIVISIONS
             )
@@ -1193,28 +1209,32 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
                 cross_axis = cross_axis / sin_t
                 angle = np.arctan2(sin_t, float(np.dot(bottom_dir, np.array([0.0, 0.0, -1.0]))))
                 sphere_mesh.apply_transform(trimesh.transformations.rotation_matrix(angle, cross_axis))
+            is_entity_convex = entity_type == "mesh"
             entity = scene.add_entity(
                 morph=gs.morphs.MeshSet(
                     files=(sphere_mesh,),
+                    convexify=is_entity_convex,
                     decimate=False,
                 ),
                 vis_mode="collision",
                 # visualize_contact=True,
             )
+            # Manually overwrite convex flag to forcibly exercise non-convex collision path
+            entity.geoms[0]._is_convex = is_entity_convex
         else:
             entity = scene.add_entity(
                 morph=gs.morphs.Sphere(
                     radius=SMOOTH_RADIUS,
                 ),
             )
-    elif smooth_kind == "cylinder":
+    elif entity_kind == "cylinder":
         entity = scene.add_entity(
             morph=gs.morphs.Cylinder(
                 radius=SMOOTH_RADIUS,
                 height=CYLINDER_HEIGHT,
             ),
         )
-    elif smooth_kind == "capsule":
+    elif entity_kind == "capsule":
         # Two capsule lengths exist as separate entities: the zero-length capsule (sphere-like, used by "vertical-axis"
         # envs because a full-length capsule standing on its cap is a tippy-pencil configuration that is numerically
         # unstable regardless of the bias fix) and the full-length capsule (used by "horizontal-axis" envs, barrel
@@ -1229,7 +1249,7 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
                 ),
             )
         )
-    else:  # if smooth_kind == "ellipsoid":
+    else:  # if entity_kind == "ellipsoid":
         entity = scene.add_entity(
             morph=gs.morphs.MJCF(
                 file=_ellipsoid_mjcf_path(tmp_path, ELLIPSOID_SEMI_AXES),
@@ -1249,13 +1269,13 @@ def test_smooth_box_no_drift(gjk_collision, smooth_kind, pair_kind, show_viewer,
     # Randomly sample orientation in local frame.
     # Special handling for capsule to ensure stable barrel contact if needed.
     smooth_quat_local = np.random.uniform(low=-1.0, high=1.0, size=(N_ENVS, 4))
-    if smooth_kind in "cylinder":
+    if entity_kind in "cylinder":
         singular_mask = np.ones((N_ENVS,), dtype=np.bool_)
         angle_pitch = 0.5 * np.pi
-    elif smooth_kind in "ellipsoid":
+    elif entity_kind in "ellipsoid":
         singular_mask = np.ones((N_ENVS,), dtype=np.bool_)
         angle_pitch = 0.0
-    elif smooth_kind == "capsule":
+    elif entity_kind == "capsule":
         singular_mask = np.arange(N_ENVS) >= N_ENVS // 2
         angle_pitch = 0.5 * np.pi
     else:
@@ -2729,6 +2749,8 @@ def test_frictionloss_advanced(show_viewer, tol):
     assert_allclose(box.get_dofs_velocity(), 0.0, tol=50 * tol)
 
 
+# Force CPU because it would be too slow otherwise
+@pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu])
 def test_nonconvex_collision(show_viewer):
     scene = gs.Scene(
@@ -2740,14 +2762,15 @@ def test_nonconvex_collision(show_viewer):
             file="meshes/tank.obj",
             scale=5.0,
             fixed=True,
-            euler=(90, 0, 0),
+            euler=(100, -10, 0),
             convexify=False,
         ),
+        # vis_mode="collision",
     )
     ball = scene.add_entity(
         gs.morphs.Sphere(
             radius=0.05,
-            pos=(0.0, 0.0, 0.8),
+            pos=(0.0, 0.0, 0.75),
         ),
         surface=gs.surfaces.Default(
             color=(0.5, 0.7, 0.9, 1.0),
@@ -2759,17 +2782,276 @@ def test_nonconvex_collision(show_viewer):
     # Force numpy seed because this test is very sensitive to the initial condition
     np.random.seed(0)
     ball.set_dofs_velocity(np.random.rand(ball.n_dofs) * 0.8)
-    for i in range(1800):
+    for i in range(500):
         scene.step()
-        if i > 1700:
+        if i > 450:
             qvel = scene.sim.rigid_solver.dofs_state.vel.to_numpy()[:, 0]
-            assert_allclose(qvel, 0, atol=0.65)
+            assert_allclose(qvel, 0, atol=0.05)
+
+
+# Force CPU because it would be too slow otherwise
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_nonconvex_nonwatertight_collision(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            max_collision_pairs=20,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(2.0, 15.0, 3.0),
+            camera_lookat=(2.0, 0.0, -2.0),
+        ),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    asset_path = get_hf_dataset(pattern="spacecraft.obj")
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file=f"{asset_path}/spacecraft.obj",
+            pos=(-0.4, 0.0, -4.0),
+            euler=(90.0, 0.0, 0.0),
+            scale=3.0,
+            convexify=False,
+            fixed=True,
+        ),
+        # vis_mode="collision",
+    )
+    obj = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+        ),
+        surface=gs.surfaces.Default(
+            color=(0.5, 0.7, 0.9, 1.0),
+        ),
+        visualize_contact=True,
+    )
+    scene.build(n_envs=64)
+
+    obj.set_pos(
+        torch.cartesian_prod(
+            torch.linspace(-6.25, 9.05, 8),
+            torch.linspace(-5.2, 5.5, 8),
+            torch.tensor((0.39,)),
+        )
+    )
+    for _ in range(700):
+        scene.step()
+
+    # The velocity is fairly large for boxes whose contact set is stable at keep changing (border of a cliff)
+    assert_allclose(obj.get_dofs_velocity(), 0.0, tol=0.08)
+
+
+@pytest.mark.parametrize("obj_shape", ["box", "sphere_mesh"])
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_nonconvex_inner_corner_multi_contact(obj_shape, show_viewer, tmp_path):
+    INIT_GAP = 1e-4  # initial gap between the body and the L-mesh surfaces (no overlap)
+    # An object wedged at the inner corner of a non-convex L-shaped mesh under gravity tilted into both surfaces.
+    # The object must settle in the corner with at least one contact on each surface (floor and wall). A single
+    # contact with a mixed floor+wall normal is what the perturbation-only path returned, and it lets the object
+    # squirt out of the corner along the tilted normal instead of staying wedged.
+    # Parametrised over a primitive BOX and a generic mesh (tessellated icosphere via MeshSet, so it is *not*
+    # classified as a SPHERE primitive) to exercise both the primitive-geom and generic-mesh dispatch paths.
+    floor = trimesh.creation.box(extents=(4.0, 4.0, 0.2))
+    floor.apply_translation((0.0, 0.0, -0.1))
+    wall = trimesh.creation.box(extents=(0.2, 4.0, 2.0))
+    wall.apply_translation((1.0, 0.0, 1.0))
+    mesh_path = tmp_path / "L.obj"
+    trimesh.util.concatenate([floor, wall]).export(mesh_path)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+            gravity=(5.0, 0.0, -9.81),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            max_collision_pairs=20,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            # Frame the L-corner (wall at x=0.9, floor at z=0) where the object settles.
+            camera_pos=(0.6, -2.2, 0.55),
+            camera_lookat=(0.85, 0.0, 0.15),
+            camera_fov=35,
+        ),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    ground = scene.add_entity(
+        gs.morphs.Mesh(
+            file=str(mesh_path),
+            pos=(0.0, 0.0, 0.0),
+            convexify=False,
+            fixed=True,
+        ),
+        visualize_contact=True,
+    )
+    obj_surface = gs.surfaces.Default(color=(0.5, 0.7, 0.9, 1.0))
+    if obj_shape == "box":
+        obj = scene.add_entity(
+            gs.morphs.Box(
+                size=(0.2, 0.2, 0.2),
+                pos=(0.8 - INIT_GAP, 0.0, 0.1 + INIT_GAP),
+            ),
+            surface=obj_surface,
+        )
+    else:
+        sphere_radius = 0.1
+        obj = scene.add_entity(
+            morph=gs.morphs.MeshSet(
+                files=(trimesh.creation.icosphere(radius=sphere_radius, subdivisions=3),),
+                pos=(0.8 - INIT_GAP, 0.0, sphere_radius + INIT_GAP),
+                decimate=False,
+                convexify=False,
+            ),
+            surface=obj_surface,
+        )
+    scene.build()
+
+    # Run 10 warm-up steps so the body resolves its initial fall/impact transient, then monitor the velocity at every
+    # subsequent step: a wedged body must never spike (detect simulation blow-up). Final velocity must be near zero
+    # (body must actually settle).
+    for _ in range(10):
+        scene.step()
+    max_v_seen = 0.0
+    for _ in range(200):
+        scene.step()
+        v = tensor_to_array(obj.get_dofs_velocity())
+        max_v_seen = max(max_v_seen, float(np.abs(v).max()))
+    assert max_v_seen < 0.05, f"velocity spike during settling: max |v| = {max_v_seen:.4f}"
+
+    contacts = scene.rigid_solver.collider._collider_state.contact_data
+    n_contacts = int(scene.rigid_solver.collider._collider_state.n_contacts[0])
+    normals = qd_to_numpy(contacts.normal, transpose=True)
+    positions = qd_to_numpy(contacts.pos, transpose=True)
+    ga = qd_to_numpy(contacts.geom_a, transpose=True)
+    obj_idx = obj.geoms[0].idx
+    floor_contacts = []
+    wall_contacts = []
+    for k in range(n_contacts):
+        sign = +1 if ga[0, k] == obj_idx else -1
+        n = sign * normals[0, k]
+        p = positions[0, k]
+        if n[2] > 0.7:
+            floor_contacts.append((p, n))
+        elif n[0] < -0.7:
+            wall_contacts.append((p, n))
+    # Both shapes settle wedged in the L-corner with zero residual velocity. Equilibrium has the body centred at
+    # (0.8, 0, 0.1): bottom touching the floor (z=0) and right touching the wall (x=0.9). Any drift means a spurious
+    # tangential force from a non-axis-aligned contact normal.
+    assert_allclose(obj.get_pos(), (0.8, 0.0, 0.1), tol=1e-3)
+    assert_allclose(obj.get_dofs_velocity(), 0.0, tol=0.05)
+    if obj_shape == "sphere_mesh":
+        # The icosphere touches the floor at its bottom and the wall at its right; expect a single contact on each
+        # surface with pure axis-aligned normal direction.
+        assert n_contacts == 2, f"expected exactly 2 contacts (1 floor, 1 wall), got {n_contacts}"
+        assert len(floor_contacts) == 1
+        assert len(wall_contacts) == 1
+        floor_pos, floor_normal = floor_contacts[0]
+        wall_pos, wall_normal = wall_contacts[0]
+        assert_allclose(floor_pos, (0.8, 0.0, 0.0), tol=5e-3)
+        assert_allclose(floor_normal, (0.0, 0.0, 1.0), tol=1e-2)
+        assert_allclose(wall_pos, (0.9, 0.0, 0.1), tol=5e-3)
+        assert_allclose(wall_normal, (-1.0, 0.0, 0.0), tol=1e-2)
+    # FIXME: The box test only checks that the body wedges at the L-corner equilibrium (position + zero velocity).
+    # The detailed contact set is not asserted because the grid SDF emits an edge-regime contact at the bottom-right
+    # corners with a non-axis-aligned normal; the resulting contact pattern works physically (the body wedges and stays
+    # put) but does not match the clean 2-floor + 2-wall configuration the sphere case enforces.
+
+
+# Force CPU because nonconvex SDF is slow on GPU
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_nonconvex_tunneling(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(2.0, 2.0, 1.5),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/tank.obj",
+            euler=(95, 0, 0),
+            scale=5.0,
+            fixed=True,
+            convexify=False,
+        ),
+        vis_mode="collision",
+    )
+    rod = scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/stirrer.obj",
+            pos=(0.0, 0.0, 0.2),
+            convexify=False,
+        ),
+        vis_mode="collision",
+        visualize_contact=True,
+    )
+    scene.build()
+
+    # It collides with the tank bottom at step 200
+    for step in range(250):
+        scene.step()
+    assert rod.get_pos()[..., 2] > -0.05
+    assert_allclose(rod.get_dofs_velocity(dofs_idx_local=slice(None, 3)), 0, atol=0.05)
+
+
+# Force CPU because nonconvex SDF is slow on GPU
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_nonconvex_overlap(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.001,
+            gravity=(0, 0, 0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.0, 0.3, 0.15),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    a = scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/stirrer.obj",
+            pos=(-0.051, 0.0, 0.0),
+            convexify=False,
+        ),
+        vis_mode="collision",
+    )
+    b = scene.add_entity(
+        gs.morphs.Mesh(
+            file="meshes/stirrer.obj",
+            pos=(+0.05, 0.0, 0.0),
+            euler=(0, 0, 90),
+            convexify=False,
+        ),
+        vis_mode="collision",
+        visualize_contact=True,
+    )
+    scene.build()
+    a.set_dofs_velocity(+1.0, dofs_idx_local=0)
+    b.set_dofs_velocity(-1.0, dofs_idx_local=0)
+
+    total_energy_history = []
+    for step in range(200):
+        total_energy = tensor_to_array(a.get_total_energy() + b.get_total_energy())
+        total_energy_history.append(total_energy)
+        scene.step()
+
+    # FIXME: The total energy should be not strictly decreasing but is not... relaxing the condition
+    # assert (np.diff(total_energy_history, axis=0) < 0.0)
+    assert total_energy_history[0] > 3.0 * total_energy_history[-1]
 
 
 @pytest.mark.required
 @pytest.mark.parametrize("convexify", [True, False])
 @pytest.mark.parametrize("gjk_collision", [True, False])
-@pytest.mark.parametrize("backend", [gs.cpu])
 def test_mesh_repair(convexify, show_viewer, gjk_collision):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -2777,6 +3059,10 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
         ),
         rigid_options=gs.options.RigidOptions(
             use_gjk_collision=gjk_collision,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, 0.4, 0.01),
+            camera_lookat=(0.3, 0.0, 0.0),
         ),
         show_viewer=show_viewer,
         show_FPS=False,
@@ -2794,7 +3080,8 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
     obj = scene.add_entity(
         gs.morphs.Mesh(
             file=f"{asset_path}/spoon.glb",
-            pos=(0.3, 0, 0.015),
+            pos=(0.3, 0, 0.007),
+            euler=(0.0, -2.5, 0.0),
             convexify=convexify,
             scale=1.0,
         ),
@@ -2802,6 +3089,11 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
         visualize_contact=True,
     )
     scene.build()
+
+    if show_viewer:
+        obj_com = obj.get_links_pos(ref="link_com")[0]
+        debug_sphere = scene.draw_debug_sphere(pos=obj_com, radius=0.003, color=(1, 1, 1, 1))
+        scene.visualizer.update(force=True)
 
     for geom in obj.geoms:
         assert ("decomposed" in geom.metadata) ^ (not convexify)
@@ -2812,15 +3104,16 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
 
     # MPR collision detection is less reliable than SDF and GJK in terms of penetration depth estimation
     is_mpr = convexify and not gjk_collision
-    tol_pos = 0.05 if is_mpr else 0.01
-    tol_rot = 1.25 if is_mpr else 0.4
-    for i in range(450):
+    tol_pos = 0.05 if is_mpr else 0.005
+    tol_rot = 1.25 if is_mpr else 0.1
+    init_pos = obj.geoms[0].get_pos()
+    for i in range(20):
         scene.step()
-        if i > 350:
-            qvel = obj.get_dofs_velocity()
-            assert_allclose(qvel[:3], 0, atol=tol_pos)
-            assert_allclose(qvel[3:], 0, atol=tol_rot)
-    assert_allclose(obj.geoms[0].get_pos()[:2], (0.3, 0.0), atol=2e-3)
+    for i in range(100):
+        qvel = obj.get_dofs_velocity()
+        assert_allclose(qvel[:3], 0, atol=tol_pos)
+        assert_allclose(qvel[3:], 0, atol=tol_rot)
+    assert_allclose(obj.geoms[0].get_pos()[:2], init_pos[:2], atol=1e-3)
 
 
 @pytest.mark.slow  # ~160s

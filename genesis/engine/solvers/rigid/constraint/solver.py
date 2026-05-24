@@ -10,6 +10,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
+from genesis.utils._tile16 import Tile16x16Cholesky
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
 
 from ..collider.contact_island import ContactIsland
@@ -1898,15 +1899,18 @@ def func_cholesky_factor_direct_tiled(
             k1 = qd.min(k0 + 16, n_dofs)
 
             # Load diagonal tile H[k,k] (rows beyond n_dofs stay as identity from the .eye() init)
-            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
-            L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:k1]
+            L_kk = Tile16x16Cholesky.eye(dtype=gs.qd_float)
+            # FIXME: migrate back to using slice index, i.e. L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:k1]
+            # and similar.
+            # We'll do this once we move _tile16.py changes back into Quadrants.
+            L_kk._load3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
 
             # Subtract prior-column contributions: L_kk -= sum_j L[k,j] @ L[k,j]^T
             for jb in range(kb):
                 j0 = jb * 16
                 for t in range(16):
-                    v = constraint_state.nt_H[i_b, k0:k1, j0 + t]
-                    L_kk -= qd.outer(v, v)
+                    v = L_kk._resolve_vec3d(constraint_state.nt_H, i_b, k0, k1, j0 + t)
+                    L_kk._ger_sub(v, v)
 
             # Factor diagonal tile in-place
             L_kk.cholesky_(EPS)
@@ -1917,25 +1921,25 @@ def func_cholesky_factor_direct_tiled(
                 i1 = qd.min(i0 + 16, n_dofs)
 
                 # Load off-diagonal tile H[i,k] (rows beyond n_dofs stay as zero from the .zeros() init)
-                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
-                L_ik[:] = constraint_state.nt_H[i_b, i0:i1, k0:k1]
+                L_ik = Tile16x16Cholesky.zeros(dtype=gs.qd_float)
+                L_ik._load3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
 
                 # Subtract prior-column contributions: L_ik -= sum_j L[i,j] @ L[k,j]^T
                 for jb in range(kb):
                     j0 = jb * 16
                     for t in range(16):
-                        v_own = constraint_state.nt_H[i_b, i0:i1, j0 + t]
-                        v_diag = constraint_state.nt_H[i_b, k0:k1, j0 + t]
-                        L_ik -= qd.outer(v_own, v_diag)
+                        v_own = L_ik._resolve_vec3d(constraint_state.nt_H, i_b, i0, i1, j0 + t)
+                        v_diag = L_ik._resolve_vec3d(constraint_state.nt_H, i_b, k0, k1, j0 + t)
+                        L_ik._ger_sub(v_own, v_diag)
 
                 # Triangular solve: L[i,k] = L_ik @ inv(L[k,k]^T)
                 L_kk.solve_triangular_(L_ik)
 
                 # Write L[i,k] back to global memory
-                constraint_state.nt_H[i_b, i0:i1, k0:k1] = L_ik
+                L_ik._store3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
 
             # Write L[k,k] back to global memory
-            constraint_state.nt_H[i_b, k0:k1, k0:k1] = L_kk
+            L_kk._store3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
 
 
 @qd.func
@@ -1979,15 +1983,15 @@ def func_cholesky_and_solve_fused_tiled(
             k1 = qd.min(k0 + 16, n_dofs)
 
             # Load diagonal tile H[k,k] (rows beyond n_dofs stay as identity from the .eye() init)
-            L_kk = qd.simt.Tile16x16.eye(dtype=gs.qd_float)
-            L_kk[:] = constraint_state.nt_H[i_b, k0:k1, k0:k1]
+            L_kk = Tile16x16Cholesky.eye(dtype=gs.qd_float)
+            L_kk._load3d(constraint_state.nt_H, i_b, k0, k1, k0, k1)
 
             # Subtract prior-column contributions from shared memory
             for jb in range(kb):
                 j0 = jb * 16
                 for t in range(16):
-                    v = L_sh[k0:k1, j0 + t]
-                    L_kk -= qd.outer(v, v)
+                    v = L_kk._resolve_vec2d(L_sh, k0, k1, j0 + t)
+                    L_kk._ger_sub(v, v)
 
             # Factor diagonal tile in-place
             L_kk.cholesky_(EPS)
@@ -1998,25 +2002,25 @@ def func_cholesky_and_solve_fused_tiled(
                 i1 = qd.min(i0 + 16, n_dofs)
 
                 # Load off-diagonal tile H[i,k] (rows beyond n_dofs stay as zero from the .zeros() init)
-                L_ik = qd.simt.Tile16x16.zeros(dtype=gs.qd_float)
-                L_ik[:] = constraint_state.nt_H[i_b, i0:i1, k0:k1]
+                L_ik = Tile16x16Cholesky.zeros(dtype=gs.qd_float)
+                L_ik._load3d(constraint_state.nt_H, i_b, i0, i1, k0, k1)
 
                 # Subtract prior-column contributions from shared memory
                 for jb in range(kb):
                     j0 = jb * 16
                     for t in range(16):
-                        v_own = L_sh[i0:i1, j0 + t]
-                        v_diag = L_sh[k0:k1, j0 + t]
-                        L_ik -= qd.outer(v_own, v_diag)
+                        v_own = L_ik._resolve_vec2d(L_sh, i0, i1, j0 + t)
+                        v_diag = L_ik._resolve_vec2d(L_sh, k0, k1, j0 + t)
+                        L_ik._ger_sub(v_own, v_diag)
 
                 # Triangular solve: L[i,k] = L_ik @ inv(L[k,k]^T)
                 L_kk.solve_triangular_(L_ik)
 
                 # Write L[i,k] to shared memory
-                L_sh[i0:i1, k0:k1] = L_ik
+                L_ik._store(L_sh, i0, i1, k0, k1)
 
             # Write L[k,k] to shared memory
-            L_sh[k0:k1, k0:k1] = L_kk
+            L_kk._store(L_sh, k0, k1, k0, k1)
 
         # --- Scalar triangular solve using L from shared memory ---
         # No longer using 16x16 tiles; the 16 threads parallelize each row's
@@ -3444,12 +3448,21 @@ def func_update_gradient_tiled(
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
 
-    # Compute Mgrad = H^{-1} @ grad, s.t. grad = M @ acc - q_force_ext - q_force_const
-    qd.loop_config(name="update_gradient_tiled", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
-        constraint_state.grad[i_d, i_b] = (
-            constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b] - constraint_state.qfrc_constraint[i_d, i_b]
-        )
+    # Compute Mgrad = H^{-1} @ grad, s.t. grad = M @ acc - q_force_ext - q_force_const.
+    # Under the DOF-vec flip, 3 of 4 in-loop accesses (grad, Ma, qfrc_constraint) are flipped and one (dofs_state.force)
+    # is canonical — swap the ndrange so adjacent lanes vary i_d.
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        qd.loop_config(name="update_gradient_tiled", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_b, i_d in qd.ndrange(_B, n_dofs):
+            constraint_state.grad[i_d, i_b] = (
+                constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b] - constraint_state.qfrc_constraint[i_d, i_b]
+            )
+    else:
+        qd.loop_config(name="update_gradient_tiled", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_d, i_b in qd.ndrange(n_dofs, _B):
+            constraint_state.grad[i_d, i_b] = (
+                constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b] - constraint_state.qfrc_constraint[i_d, i_b]
+            )
 
     if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
         qd.loop_config(
@@ -3659,14 +3672,27 @@ def initialize_Ma(
     _B = rigid_global_info.mass_mat.shape[2]
     n_dofs = qacc.shape[0]
 
-    qd.loop_config(name="init_ma", serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_d1, i_b in qd.ndrange(n_dofs, _B):
-        I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
-        i_e = dofs_info.entity_idx[I_d1]
-        Ma_ = gs.qd_float(0.0)
-        for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-            Ma_ = Ma_ + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * qacc[i_d2, i_b]
-        Ma[i_d1, i_b] = Ma_
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        # Flipped mass_mat layout=(2,1,0): physical (_B, n_dofs, n_dofs) with i_d1 stride-1. Make i_d1 the innermost
+        # ndrange axis so adjacent lanes vary i_d1 -> coalesced reads of mass_mat[i_d1, i_d2, i_b]. qacc[i_d2, i_b] is
+        # constant within the warp -> broadcast load.
+        qd.loop_config(name="init_ma", serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_b, i_d1 in qd.ndrange(_B, n_dofs):
+            I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+            i_e = dofs_info.entity_idx[I_d1]
+            Ma_ = gs.qd_float(0.0)
+            for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                Ma_ = Ma_ + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * qacc[i_d2, i_b]
+            Ma[i_d1, i_b] = Ma_
+    else:
+        qd.loop_config(name="init_ma", serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
+        for i_d1, i_b in qd.ndrange(n_dofs, _B):
+            I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+            i_e = dofs_info.entity_idx[I_d1]
+            Ma_ = gs.qd_float(0.0)
+            for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                Ma_ = Ma_ + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * qacc[i_d2, i_b]
+            Ma[i_d1, i_b] = Ma_
 
 
 # ======================================================= Core ========================================================
@@ -3742,13 +3768,24 @@ def func_solve_init(
             else:
                 constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
     else:
-        # Always initialize from warmstart
-        qd.loop_config(name="from_warmstart", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_d, i_b in qd.ndrange(n_dofs, _B):
-            if constraint_state.n_constraints[i_b] > 0 and constraint_state.is_warmstart[i_b]:
-                constraint_state.qacc[i_d, i_b] = constraint_state.qacc_ws[i_d, i_b]
-            else:
-                constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
+        # Always initialize from warmstart.
+        # Under the DOF-vec flip, both qacc and qacc_ws are env-leading; swap the ndrange so adjacent lanes vary i_d
+        # to coalesce those writes/reads. The dofs_state.acc_smooth read remains canonical (small per-env working
+        # set, dominated by the qacc write).
+        if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+            qd.loop_config(name="from_warmstart", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+            for i_b, i_d in qd.ndrange(_B, n_dofs):
+                if constraint_state.n_constraints[i_b] > 0 and constraint_state.is_warmstart[i_b]:
+                    constraint_state.qacc[i_d, i_b] = constraint_state.qacc_ws[i_d, i_b]
+                else:
+                    constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
+        else:
+            qd.loop_config(name="from_warmstart", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+            for i_d, i_b in qd.ndrange(n_dofs, _B):
+                if constraint_state.n_constraints[i_b] > 0 and constraint_state.is_warmstart[i_b]:
+                    constraint_state.qacc[i_d, i_b] = constraint_state.qacc_ws[i_d, i_b]
+                else:
+                    constraint_state.qacc[i_d, i_b] = dofs_state.acc_smooth[i_d, i_b]
 
         initialize_Ma(
             Ma=constraint_state.Ma,
@@ -3796,9 +3833,14 @@ def func_solve_init(
         static_rigid_sim_config=static_rigid_sim_config,
     )
 
-    qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
-        constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
+    if qd.static(static_rigid_sim_config.constraint_layout_transposed):
+        qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_b, i_d in qd.ndrange(_B, n_dofs):
+            constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
+    else:
+        qd.loop_config(name="assign_search", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        for i_d, i_b in qd.ndrange(n_dofs, _B):
+            constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
 
 
 @qd.func
