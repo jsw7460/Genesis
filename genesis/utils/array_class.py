@@ -695,6 +695,9 @@ class ColliderState:
     narrowphase_work_queues: NarrowphaseWorkQueues
     contact_sort_key: qd.Tensor
     contact_sort_idx: qd.Tensor
+    contact_proj_v: qd.Tensor
+    contact_keep: qd.Tensor
+    contact_hull_stack: qd.Tensor
 
 
 def get_collider_state(
@@ -724,6 +727,7 @@ def get_collider_state(
     box_axi_shape = maybe_shape((3, _B), static_rigid_sim_config.box_box_detection)
     box_ppts2_shape = maybe_shape((4, 2, _B), static_rigid_sim_config.box_box_detection)
     box_pu_shape = maybe_shape((4, _B), static_rigid_sim_config.box_box_detection)
+    prune_shape = maybe_shape((max(max_contact_pairs, 1), _B), collider_static_config.has_prunable_contacts)
 
     return ColliderState(
         sort_buffer=get_sort_buffer(solver),
@@ -753,6 +757,9 @@ def get_collider_state(
         ),
         contact_sort_key=V(dtype=gs.qd_float, shape=(max(max_contact_pairs, 1), _B)),
         contact_sort_idx=V(dtype=gs.qd_int, shape=(max(max_contact_pairs, 1), _B)),
+        contact_proj_v=V(dtype=gs.qd_float, shape=prune_shape),
+        contact_keep=V(dtype=gs.qd_int, shape=prune_shape),
+        contact_hull_stack=V(dtype=gs.qd_int, shape=prune_shape),
     )
 
 
@@ -782,6 +789,9 @@ class ColliderInfo:
     # differentiable contact tolerance
     diff_pos_tolerance: qd.Tensor
     diff_normal_tolerance: qd.Tensor
+    # link-pair contact pruning
+    contact_pruning_tolerance: qd.Tensor
+    prune_deep_penetration_ratio: qd.Tensor
 
 
 def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_config, **kwargs):
@@ -812,6 +822,8 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         mpr_to_gjk_overlap_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["mpr_to_gjk_overlap_ratio"]),
         diff_pos_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_pos_tolerance"]),
         diff_normal_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["diff_normal_tolerance"]),
+        contact_pruning_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["contact_pruning_tolerance"]),
+        prune_deep_penetration_ratio=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["prune_deep_penetration_ratio"]),
     )
 
 
@@ -826,6 +838,16 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     has_non_box_plane_convex_convex: bool
     has_convex_specialization: bool
     has_nonconvex_nonterrain: bool
+    # True when link-pair contact pruning can ever do useful work. False when every link has at most one convex geom
+    # and no terrain is present (each (link_a, link_b) bucket then holds at most one geom-pair's contacts, capped at
+    # n_contacts_per_pair, so the 2D hull is at best a marginal reduction) or when use_contact_island is True (the
+    # contact-island path consumes contact_data in physical layout and does not honor the sort_idx indirection).
+    # Lets us skip the pruning kernel call and its scratch buffers entirely.
+    has_prunable_contacts: bool
+    # True when func_clamp_prune_and_sort_contacts should also spatial-sort contacts by x-position. Gated by both
+    # narrowphase configuration (only meaningful when has_non_box_plane_convex_convex on GPU) and use_contact_island
+    # (the island path does not honor the resulting sort_idx permutation).
+    spatial_sort_supported: bool
     # maximum number of contact pairs per collision pair
     n_contacts_per_pair: int
     # ccd algorithm
@@ -2098,6 +2120,10 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     broadphase_traversal: int = 0
     enable_tiled_cholesky_mass_matrix: bool = False
     enable_tiled_cholesky_hessian: bool = False
+    # Register-tile width for the Hessian Cholesky kernels: 16 (Tile16x16) or 32 (Tile32x32). Selected at build time
+    # based on n_dofs: 32 wins for large problems (e.g. dex_hand, n_dofs=62); 16 wins when n_dofs is small or lands in a
+    # padding-unfavorable band (e.g. g1_fall, n_dofs=35).
+    cholesky_tile_size: int = 32
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.
