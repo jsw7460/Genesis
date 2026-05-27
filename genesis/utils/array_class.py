@@ -698,6 +698,10 @@ class ColliderState:
     contact_proj_v: qd.Tensor
     contact_keep: qd.Tensor
     contact_hull_stack: qd.Tensor
+    # Per-bucket lex sort permutation used by the cooperative dedup kernel
+    # (func_clamp_prune_and_sort_contacts_coop) for the phase-3 (u, v) lex sort. Sized to max_contact_pairs because
+    # each env writes its own permutation.
+    contact_lex_idx: qd.Tensor
 
 
 def get_collider_state(
@@ -712,14 +716,15 @@ def get_collider_state(
     n_geoms = solver.n_geoms_
     max_collision_pairs = min(solver.max_collision_pairs, n_possible_pairs)
     max_collision_pairs_broad = max_collision_pairs * max_collision_pairs_broad_k
-    max_contact_pairs = max_collision_pairs * collider_static_config.n_contacts_per_pair
+    # Already sized per regime (convex vs nonconvex) by Collider._init_max_contact_pairs, which runs before this.
+    max_contact_pairs = max(collider_info.max_contact_pairs[None], 1)
     requires_grad = static_rigid_sim_config.requires_grad
 
     box_depth_shape = maybe_shape(
-        (collider_static_config.n_contacts_per_pair, _B), static_rigid_sim_config.box_box_detection
+        (collider_static_config.n_contacts_per_nonconvex_pair, _B), static_rigid_sim_config.box_box_detection
     )
     box_points_shape = maybe_shape(
-        (collider_static_config.n_contacts_per_pair, _B), static_rigid_sim_config.box_box_detection
+        (collider_static_config.n_contacts_per_nonconvex_pair, _B), static_rigid_sim_config.box_box_detection
     )
     box_pts_shape = maybe_shape((6, _B), static_rigid_sim_config.box_box_detection)
     box_lines_shape = maybe_shape((4, _B), static_rigid_sim_config.box_box_detection)
@@ -760,6 +765,7 @@ def get_collider_state(
         contact_proj_v=V(dtype=gs.qd_float, shape=prune_shape),
         contact_keep=V(dtype=gs.qd_int, shape=prune_shape),
         contact_hull_stack=V(dtype=gs.qd_int, shape=prune_shape),
+        contact_lex_idx=V(dtype=gs.qd_int, shape=prune_shape),
     )
 
 
@@ -838,10 +844,10 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     has_non_box_plane_convex_convex: bool
     has_convex_specialization: bool
     has_nonconvex_nonterrain: bool
-    # True when link-pair contact pruning can ever do useful work. False when every link has at most one convex geom
-    # and no terrain is present (each (link_a, link_b) bucket then holds at most one geom-pair's contacts, capped at
-    # n_contacts_per_pair, so the 2D hull is at best a marginal reduction) or when use_contact_island is True (the
-    # contact-island path consumes contact_data in physical layout and does not honor the sort_idx indirection).
+    # True when link-pair contact pruning can ever do useful work. False when every link has at most one convex geom and
+    # no terrain is present (each (link_a, link_b) bucket then holds at most one geom-pair's contacts, capped at
+    # n_contacts_per_convex_pair, so the 2D hull is at best a marginal reduction), or when use_contact_island is True
+    # (the contact-island path consumes contact_data in physical layout and does not honor the sort_idx indirection).
     # Lets us skip the pruning kernel call and its scratch buffers entirely.
     has_prunable_contacts: bool
     # True when func_clamp_prune_and_sort_contacts should also spatial-sort contacts by x-position. Gated by both
@@ -849,7 +855,9 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     # (the island path does not honor the resulting sort_idx permutation).
     spatial_sort_supported: bool
     # maximum number of contact pairs per collision pair
-    n_contacts_per_pair: int
+    n_contacts_per_convex_pair: int
+    # maximum number of contact pairs per nonconvex (vertex-vs-SDF) collision pair; >= n_contacts_per_convex_pair
+    n_contacts_per_nonconvex_pair: int
     # ccd algorithm
     ccd_algorithm: int
 
@@ -2124,6 +2132,11 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # based on n_dofs: 32 wins for large problems (e.g. dex_hand, n_dofs=62); 16 wins when n_dofs is small or lands in a
     # padding-unfavorable band (e.g. g1_fall, n_dofs=35).
     cholesky_tile_size: int = 32
+    # When True, the warm-start factor+solve in ``func_solve_init`` is dispatched through
+    # ``func_cholesky_and_solve_fused_tiled`` (single kernel, L kept in shared memory) instead of the separate
+    # ``func_cholesky_factor_direct_tiled`` + ``func_cholesky_solve_tiled`` pair. Requires
+    # ``enable_tiled_cholesky_hessian`` for the fused kernel to be available.
+    enable_fused_factor_solve_init: bool = False
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.
