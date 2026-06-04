@@ -1219,6 +1219,7 @@ def test_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_vie
             surface=gs.surfaces.Default(
                 smooth=False,
             ),
+            visualize_contact=True,
         )
         # Manually overwrite convex flag to forcibly exercise non-convex collision path
         box.geoms[0]._is_convex = is_ground_convex
@@ -1233,6 +1234,7 @@ def test_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_vie
                 pos=terrain_pos_world,
                 quat=tilt_quat,
             ),
+            visualize_contact=True,
         )
     elif ground_type == "plane":
         plane_pos_world = R @ np.array([0.0, 0.0, HEIGHT])
@@ -1243,6 +1245,7 @@ def test_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_vie
                 quat=tilt_quat,
                 fixed=True,
             ),
+            visualize_contact=True,
         )
     else:  # if ground_type == "prim":
         scene.add_entity(
@@ -1434,7 +1437,8 @@ def test_contact_dedup(surface_kind, show_viewer):
 
 
 @pytest.mark.required
-def test_contact_pruning(show_viewer):
+@pytest.mark.parametrize("gjk_collision", [True, False])
+def test_contact_pruning(gjk_collision, show_viewer):
     GEOM_HALF_SIZE = 0.1
     MARGIN = 1e-4
 
@@ -1445,7 +1449,7 @@ def test_contact_pruning(show_viewer):
         ),
         rigid_options=gs.options.RigidOptions(
             # box_box_detection=True,
-            use_gjk_collision=True,
+            use_gjk_collision=gjk_collision,
             contact_pruning_tolerance=0.02,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -2266,7 +2270,6 @@ def test_set_sol_params(n_envs, batched, tol):
             assert_allclose(obj.sol_params, [2.0e-02, 0.5, 1e-4, 1e-4, 0.0, 1e-4, 1.0], tol=tol)
 
 
-@pytest.mark.slow  # ~160s
 @pytest.mark.required
 @pytest.mark.mujoco_compatibility(False)
 @pytest.mark.parametrize("xml_path", ["xml/humanoid.xml"])
@@ -2281,11 +2284,21 @@ def test_stickman(gs_sim, mj_sim, tol):
     # Initialize the simulation
     init_simulators(gs_sim)
 
-    # Run the simulation for a few steps
-    qvel_norminf_all = []
-    for i in range(6000):
+    # Make sure that the simulation is deterministic
+    (gs_robot,) = gs_sim.entities
+    gs_sim.scene.reset()
+    gs_sim.scene.step()
+    dofs_vel = gs_robot.get_dofs_velocity()
+    for _ in range(50):
+        gs_sim.scene.reset()
         gs_sim.scene.step()
-        if i > 4000:
+        assert_allclose(gs_robot.get_dofs_velocity(), dofs_vel, tol=0.0)
+
+    # Run the simulation for a while
+    qvel_norminf_all = []
+    for i in range(750):
+        gs_sim.scene.step()
+        if i > 700:
             (gs_robot,) = gs_sim.entities
             qvel = gs_robot.get_dofs_velocity()
             qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
@@ -3459,7 +3472,7 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
         show_FPS=False,
     )
     asset_path = get_hf_dataset(pattern="work_table.glb")
-    table = scene.add_entity(
+    scene.add_entity(
         gs.morphs.Mesh(
             file=f"{asset_path}/work_table.glb",
             pos=(0.4, 0.0, -0.54),
@@ -3471,8 +3484,8 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
     obj = scene.add_entity(
         gs.morphs.Mesh(
             file=f"{asset_path}/spoon.glb",
-            pos=(0.3, 0, 0.007),
-            euler=(0.0, -2.5, 0.0),
+            pos=(0.3, 0, 0.009),
+            euler=(0.0, -2.5 if convexify else 0.0, 0.0),
             convexify=convexify,
             scale=1.0,
         ),
@@ -3483,7 +3496,7 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
 
     if show_viewer:
         obj_com = obj.get_links_pos(ref="link_com")[0]
-        debug_sphere = scene.draw_debug_sphere(pos=obj_com, radius=0.003, color=(1, 1, 1, 1))
+        scene.draw_debug_sphere(pos=obj_com, radius=0.003, color=(1, 1, 1, 1))
         scene.visualizer.update(force=True)
 
     for geom in obj.geoms:
@@ -3498,9 +3511,9 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
     tol_pos = 0.05 if is_mpr else 0.005
     tol_rot = 1.25 if is_mpr else 0.5
     init_pos = obj.geoms[0].get_pos()
-    for i in range(50):
+    for _ in range(50):
         scene.step()
-    for i in range(100):
+    for _ in range(100):
         scene.step()
         qvel = obj.get_dofs_velocity()
         assert_allclose(qvel[:3], 0, atol=tol_pos)
@@ -3513,7 +3526,7 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
 @pytest.mark.parametrize("euler", [(90, 0, 90), (74, 15, 90)])
 @pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_convexify(euler, backend, show_viewer, gjk_collision):
+def test_convexify(euler, show_viewer, gjk_collision):
     OBJ_OFFSET_X = 0.0  # 0.02
     OBJ_OFFSET_Y = 0.15
 
@@ -3645,7 +3658,7 @@ def test_num_contact_overflow(show_viewer):
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
 @pytest.mark.parametrize("gjk_collision", [True, False])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_collision_edge_cases(gs_sim, mode, gjk_collision):
+def test_collision_edge_cases(gs_sim, mode):
     qpos_0 = gs_sim.rigid_solver.get_dofs_position()
     for _ in range(200):
         gs_sim.scene.step()
@@ -5511,6 +5524,7 @@ def test_contype_conaffinity(show_viewer, tol):
         surface=gs.surfaces.Default(
             color=(0.0, 0.0, 1.0, 1.0),
         ),
+        visualize_contact=True,
     )
     box4 = scene.add_entity(
         morph=gs.morphs.Box(
@@ -5522,6 +5536,7 @@ def test_contype_conaffinity(show_viewer, tol):
         surface=gs.surfaces.Default(
             color=(0.8, 0.8, 0.8, 1.0),
         ),
+        visualize_contact=True,
     )
     scene.build()
 
