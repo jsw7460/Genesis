@@ -1,5 +1,46 @@
 # Genesis Release Note
 
+## 1.1.2
+
+This minor release introduces morph pose offset to finally provide a viable solution to the long-lasting inconstency of spatial accessors related to non-standard mesh axes conventions (0.3.13) and inertia alignment (0.4.4). Besides, fixed-size buffers are now sized more tightly to significantly reduce the default memory footprint.
+
+### Breaking changes
+
+* Add morph pose offset and relative-frame pose accessors for rigid bodies. (@duburcqa) (#2934)
+
+### New Features
+
+* Add pruning-aware sizing of contact constraint buffers using 'max_contacts' option. (@duburcqa) (#2928)
+
+### Bug Fixes
+
+* Fix island support in rigid body solver. (@duburcqa) (#2930)
+* Fix serialized batched simulation on CPU scaling sub-linearly. (@duburcqa) (#2929)
+
+### Miscellaneous
+
+* Allocate rigid entity Jacobian and IK fields lazily on first use. (@duburcqa) (#2933)
+
+## 1.1.1
+
+This minor release mainly improves the robustness of rigid collision detection for both convex and non-convex geometries. It is no longer considered experimental to disable convex decomposition when higher fidelity is necessary.
+
+### Bug Fixes
+
+* Deduplicate textures across GLB submeshes sharing a material. (@duburcqa) (#2896)
+* Skip grayscale conversion for colorized segmentation maps. (@ACMLCZH) (#2901)
+* Fix non-deterministic simulation on GPU. (@duburcqa) (#2898, #2907, #2909)
+* Fix non-convex collision detection for concave geometries. (@duburcqa) (#2903)
+* More robust perturbation-based multi-contact convex-convex collision detection. (@duburcqa) (#2917, #2921)
+
+### Miscellaneous
+
+* Support passing sliced env mask to RigidSolver.set_base_links_(pos|quat). (@duburcqa) (#2897)
+* Improve interactive scene mode. (@duburcqa) (#2899)
+* Use qd.ndrange(axes=) to collapse layout-flip duplications. (@hughperkins) (#2861)
+* Switch dedupe contact sort to use Quadrants bitonic sort (@hughperkins) (#2853)
+* Move register-tile Cholesky into quadrants. (@hughperkins) (#2860)
+
 ## 1.1.0
 
 This release focuses on performance improvement and numerical stability of rigid solver. Genesis speed should drop less aggressively as the complexity of the scene increases, notably the number of decomposed convex geoms, floating-base entities, and dofs.

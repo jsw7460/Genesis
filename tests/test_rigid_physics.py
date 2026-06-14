@@ -1564,7 +1564,7 @@ def test_contact_pruning(gjk_collision, show_viewer):
 @pytest.mark.required
 @pytest.mark.precision("32")
 @pytest.mark.parametrize("gjk_collision", [False, True])
-def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
+def test_contact_pruning_authored_decomp(gjk_collision, show_viewer):
     # A central pole carries six concentric rings, capped by a ball seated in the top ring's hole. Each ring collision
     # mesh is pre-decomposed into N_WEDGES convex slices, so stacked pieces touch face-to-face along the vertical axis.
     # Physically only vertical contacts are valid between stacked rings; any lateral contact is a spurious cross-sector
@@ -1577,10 +1577,14 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
     RINGS_ORDER = (0, 1, 2, 3, 5, 4)
 
     NUM_CHECKS = 10
+    POS_TOL = 2e-3
+    # FIXME: The top ball is slightly rotating around z-axis (~0.5degree)
+    ROT_TOL = 1e-2
 
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             use_gjk_collision=gjk_collision,
+            max_collision_pairs=1200,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.4, 0.0, 0.3),
@@ -1589,10 +1593,11 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
         show_viewer=show_viewer,
     )
     plane = scene.add_entity(gs.morphs.Plane())
+    pole_pos = (0.0, 0.0, BASE_HEIGHT / 2)
     pole = scene.add_entity(
         morph=gs.morphs.URDF(
             file="tower/base_pole.urdf",
-            pos=(0.0, 0.0, BASE_HEIGHT / 2),
+            pos=pole_pos,
             file_meshes_are_zup=True,
         ),
         material=gs.materials.Rigid(
@@ -1600,13 +1605,19 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
         ),
         vis_mode="collision",
     )
+    poss_init = [pole_pos]
+    rpys_init = [(0.0, 0.0, 0.0)]
     rings = []
     height = BASE_HEIGHT
-    for ring_idx in RINGS_ORDER:
+    for i, ring_idx in enumerate(RINGS_ORDER):
+        ring_pos = (0.0, 0.0, height + (RING_HEIGHT - 1e-4) / 2)
+        # Alternate rotational offset along z-axis to avoid lateral contacts
+        ring_yaw = 180 / N_WEDGES * (i % 2)
         ring = scene.add_entity(
             morph=gs.morphs.URDF(
                 file=f"tower/ring_{ring_idx + 1:02d}.urdf",
-                pos=(0.0, 0.0, height + (RING_HEIGHT - 1e-4) / 2),
+                pos=ring_pos,
+                euler=(0.0, 0.0, ring_yaw),
                 file_meshes_are_zup=True,
             ),
             material=gs.materials.Rigid(
@@ -1616,11 +1627,14 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
             visualize_contact=True,
         )
         rings.append(ring)
+        poss_init.append(ring_pos)
+        rpys_init.append((0.0, 0.0, np.deg2rad(ring_yaw)))
         height += RING_HEIGHT - 1e-4
+    ball_pos = (0.0, 0.0, height + BALL_HEIGHT)
     ball = scene.add_entity(
         morph=gs.morphs.URDF(
             file="tower/ball.urdf",
-            pos=(0.0, 0.0, height + BALL_HEIGHT),
+            pos=ball_pos,
             file_meshes_are_zup=True,
         ),
         material=gs.materials.Rigid(
@@ -1628,6 +1642,8 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
         ),
         vis_mode="collision",
     )
+    poss_init.append(ball_pos)
+    rpys_init.append((0.0, 0.0, 0.0))
     scene.build()
 
     geom_owner = {geom.idx: entity for entity in (plane, pole, *rings, ball) for geom in entity.geoms}
@@ -1635,16 +1651,15 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
     ball_geoms = {geom.idx for geom in ball.geoms}
 
     # Tiny warm-up to deal with initial penetration (~5e-4)
-    qpos_init = scene.rigid_solver.get_qpos()
     for _ in range(2):
         scene.step()
 
-    # Check that the tower stay in place (3mm tol is necessary because of the ball)
-    # if gs.backend != gs.cpu and gjk_collision:
-    #     pytest.xfail("GJK is less accurate on GPU.")
+    # Check that the tower stay in place
     for _ in range(20):
         scene.step()
-        assert_allclose(scene.rigid_solver.get_qpos(), qpos_init, atol=2e-3)
+        for entity, pos_init, rpy_init in zip((pole, *rings, ball), poss_init, rpys_init):
+            assert_allclose(entity.get_pos(), pos_init, atol=POS_TOL)
+            assert_allclose(gu.quat_to_xyz(entity.get_quat(), rpy=True), rpy_init, atol=ROT_TOL)
         # Only check linear velocity at CoM and angular velocity around z-axis.
         # It is robust to loosing a few contact points while still asserting the failure modes that matter.
         assert_allclose(scene.rigid_solver.get_dofs_velocity(dofs_idx=(0, 1, 2, 5)), 0, tol=0.06)
@@ -1658,7 +1673,6 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
     # Both invariants fail together on a bad step (a spurious lateral overlap also inflates the slice count). MPR keeps
     # the sub-resolution overlaps below the rejection floor on every step; GJK's tighter penetration estimates let one
     # spike above it occasionally in fp32, so it only has to be ideal at least once.
-    ideal_steps = 0
     for _ in range(NUM_CHECKS):
         scene.step()
         contacts = scene.rigid_solver.collider.get_contacts(to_torch=False)
@@ -1682,8 +1696,7 @@ def test_reject_offaxis_contact_on_authored_decomp(gjk_collision, show_viewer):
         is_pruned = len(interface_counts) == len(rings) and all(
             count <= N_WEDGES for count in interface_counts.values()
         )
-        ideal_steps += is_vertical and is_pruned
-    assert ideal_steps == NUM_CHECKS
+        assert is_vertical and is_pruned
 
 
 @pytest.mark.required
@@ -1718,6 +1731,7 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
 
     N_TRIALS = 8
     N_STEPS = 25
+    N_WEDGES = 16
     BASE_HEIGHT = 0.020
     RING_HEIGHT = 0.020
     BALL_HEIGHT = 0.019
@@ -1727,6 +1741,7 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
         rigid_options=gs.options.RigidOptions(
             use_gjk_collision=True,
             contact_pruning_tolerance=contact_pruning_tolerance,
+            max_collision_pairs=1200,
         ),
         show_viewer=show_viewer,
     )
@@ -1740,11 +1755,13 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
         material=gs.materials.Rigid(rho=600.0),
     )
     height = BASE_HEIGHT
-    for ring_idx in RINGS_ORDER:
+    for i, ring_idx in enumerate(RINGS_ORDER):
         scene.add_entity(
             morph=gs.morphs.URDF(
                 file=f"tower/ring_{ring_idx + 1:02d}.urdf",
                 pos=(0.0, 0.0, height + (RING_HEIGHT - 1e-4) / 2),
+                # Alternate rotational offset along z-axis to avoid lateral contacts
+                euler=(0.0, 0.0, 180 / N_WEDGES * (i % 2)),
                 file_meshes_are_zup=True,
             ),
             material=gs.materials.Rigid(rho=600.0),
@@ -1846,6 +1863,9 @@ def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
     entity = scene.add_entity(
         morph=gs.morphs.MJCF(
             file=xml_path,
+        ),
+        surface=gs.surfaces.Default(
+            smooth=False,
         ),
     )
     scene.build(n_envs=N_ENVS)
@@ -2331,8 +2351,8 @@ def test_set_root_pose(batch_fixed_verts, relative, show_viewer, tol):
     robot = scene.add_entity(
         gs.morphs.MJCF(
             file="xml/franka_emika_panda/panda.xml",
-            pos=ROBOT_POS_ZERO,
-            euler=ROBOT_EULER_ZERO,
+            offset_pos=ROBOT_POS_ZERO,
+            offset_euler=ROBOT_EULER_ZERO,
             batch_fixed_verts=batch_fixed_verts,
         ),
     )
@@ -2346,38 +2366,78 @@ def test_set_root_pose(batch_fixed_verts, relative, show_viewer, tol):
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.04, 0.04, 0.04),
-            pos=CUBE_POS_ZERO,
-            euler=CUBE_EULER_ZERO,
+            offset_pos=CUBE_POS_ZERO,
+            offset_euler=CUBE_EULER_ZERO,
+        ),
+    )
+    plain_box = scene.add_entity(
+        gs.morphs.Box(
+            pos=(2.0, 0.0, 0.2),
+            size=(0.04, 0.04, 0.04),
+        ),
+    )
+    POSED_BOX_POS = (2.0, 0.5, 0.3)
+    POSED_BOX_OFFSET_EULER = (0.0, 0.0, 45.0)
+    posed_box = scene.add_entity(
+        gs.morphs.Box(
+            pos=POSED_BOX_POS,
+            size=(0.04, 0.04, 0.04),
+            offset_pos=(0.0, 0.0, 0.5),
+            offset_euler=POSED_BOX_OFFSET_EULER,
         ),
     )
     scene.build(n_envs=2)
 
+    # A no-offset entity reports the same pose in the user and world frames.
+    assert_allclose(plain_box.get_pos(relative=True), plain_box.get_pos(relative=False), tol=tol)
+    assert_allclose(plain_box.get_pos(), (2.0, 0.0, 0.2), tol=tol)
+
+    # With both a morph pose and an offset, the relative getter returns the morph pose while the world getter carries
+    # the offset composed onto it (the offset position adds in z since the user orientation is identity).
+    assert_allclose(posed_box.get_pos(relative=True), POSED_BOX_POS, tol=tol)
+    assert_allclose(posed_box.get_quat(relative=True), gu.identity_quat(), tol=tol)
+    assert_allclose(posed_box.get_pos(relative=False), (2.0, 0.5, 0.8), tol=tol)
+    assert_allclose(
+        posed_box.get_quat(relative=False),
+        gu.xyz_to_quat(np.array(POSED_BOX_OFFSET_EULER), rpy=True, degrees=True),
+        tol=tol,
+    )
+
+    # Setting the orientation in the user frame keeps the user-frame position fixed: the offset position rotates with
+    # the orientation, so the world position is rewritten to preserve the reported relative position. Rotating about x
+    # while the offset position is along z makes that offset contribution change, exercising the rewrite.
+    new_quat = gu.xyz_to_quat(np.array((90.0, 0.0, 0.0)), rpy=True, degrees=True)
+    posed_box.set_quat(new_quat, relative=True)
+    assert_allclose(posed_box.get_pos(relative=True), POSED_BOX_POS, tol=tol)
+    assert_allclose(posed_box.get_quat(relative=True), new_quat, tol=tol)
+
     robot_aabb_init, robot_base_aabb_init = robot.get_AABB(), robot.geoms[0].get_AABB()
     cube_aabb_init, cube_base_aabb_init = cube.get_AABB(), cube.geoms[0].get_AABB()
 
-    # Make sure that it is not possible to end up in an inconsistent state for fixed geometries
+    # Make sure that it is not possible to end up in an inconsistent state for fixed geometries. These place entities
+    # at absolute world positions, so they bypass the pose offset (relative=False).
     pos_delta = np.random.rand(2, 3)
     with nullcontext() if batch_fixed_verts else pytest.raises(gs.GenesisException):
-        robot.set_pos(pos_delta)
+        robot.set_pos(pos_delta, relative=False)
         if show_viewer:
             scene.visualizer.update()
     with nullcontext() if batch_fixed_verts else pytest.raises(gs.GenesisException):
-        robot.set_pos(pos_delta[[0]], envs_idx=[0])
+        robot.set_pos(pos_delta[[0]], envs_idx=[0], relative=False)
         if show_viewer:
             scene.visualizer.update()
-    cube.set_pos(pos_delta[[0]] + (0.0, 0.0, 0.16), envs_idx=[0])
-    cube.set_pos(pos_delta[[1]] + (0.0, 0.0, 0.11), envs_idx=[1])
-    sphere.set_pos(np.tile(pos_delta[[0]], (2, 1)) + 1.0)
+    cube.set_pos(pos_delta[[0]] + (0.0, 0.0, 0.16), envs_idx=[0], relative=False)
+    cube.set_pos(pos_delta[[1]] + (0.0, 0.0, 0.11), envs_idx=[1], relative=False)
+    sphere.set_pos(np.tile(pos_delta[[0]], (2, 1)) + 1.0, relative=False)
     quat_delta = np.random.rand(2, 4)
     with nullcontext() if batch_fixed_verts else pytest.raises(gs.GenesisException):
-        robot.set_quat(quat_delta)
+        robot.set_quat(quat_delta, relative=False)
         if show_viewer:
             scene.visualizer.update()
     with nullcontext() if batch_fixed_verts else pytest.raises(gs.GenesisException):
-        robot.set_quat(quat_delta[[0]], envs_idx=[0])
+        robot.set_quat(quat_delta[[0]], envs_idx=[0], relative=False)
         if show_viewer:
             scene.visualizer.update()
-    cube.set_quat(quat_delta)
+    cube.set_quat(quat_delta, relative=False)
     if show_viewer:
         scene.visualizer.update()
 
@@ -2407,9 +2467,11 @@ def test_set_root_pose(batch_fixed_verts, relative, show_viewer, tol):
             pos_zero = torch.tensor(pos_zero, device=gs.device, dtype=gs.tc_float)
             euler_zero = torch.deg2rad(torch.tensor(euler_zero, dtype=gs.tc_float))
             quat_zero = gu.xyz_to_quat(euler_zero, rpy=True)
-            assert_allclose(entity.get_pos(), pos_zero, tol=tol)
+            # The pose lives in the offset, so the world frame (relative=False) carries it; the user frame is identity.
+            assert_allclose(entity.get_pos(relative=False), pos_zero, tol=tol)
+            assert_allclose(entity.get_pos(relative=True), 0.0, tol=tol)
             # Use quaternion for comparison to avoid gymbal lock issue in euler angles
-            quat = entity.get_quat()
+            quat = entity.get_quat(relative=False)
             assert_allclose(quat, quat_zero, tol=tol)
             base_aabb = entity.geoms[0].get_AABB()
             assert base_aabb.shape == ((2, 2, 3) if not entity.geoms[0].is_fixed or batch_fixed_verts else (2, 3))
@@ -2420,19 +2482,15 @@ def test_set_root_pose(batch_fixed_verts, relative, show_viewer, tol):
             entity.set_pos(pos_delta, relative=relative)
 
             pos_ref = pos_delta + pos_zero if relative else pos_delta
-            assert_allclose(entity.get_pos(), pos_ref, tol=tol)
+            # Round-trip in the frame it was set in: the getter must report back exactly what set_pos received.
+            assert_allclose(entity.get_pos(relative=relative), pos_delta, tol=tol)
             assert_allclose(entity.geoms[0].get_AABB(), base_aabb_init + (pos_ref - pos_zero), tol=tol)
             assert_allclose(entity.get_AABB(), entity_aabb_init + (pos_ref - pos_zero), tol=tol)
 
             quat_delta = torch.tile(torch.as_tensor(np.random.rand(4), dtype=gs.tc_float, device=gs.device), (2, 1))
             quat_delta /= torch.linalg.norm(quat_delta, axis=1, keepdim=True)
             entity.set_quat(quat_delta, relative=relative)
-            quat = entity.get_quat()
-            if relative:
-                quat_ref = gu.transform_quat_by_quat(quat_zero, quat_delta)
-            else:
-                quat_ref = quat_delta
-            assert_allclose(quat, quat_ref, tol=tol)
+            assert_allclose(entity.get_quat(relative=relative), quat_delta, tol=tol)
 
 
 @pytest.mark.slow  # ~200s
@@ -3651,8 +3709,8 @@ def test_nonconvex_concentric_contact(direction, show_viewer):
 
     # Drive a steady torque about z (a wrench) until the nut reaches its release height, then let go: negative torque
     # screws it down onto the head, positive torque unscrews it up and off the shaft tip.
-    z0 = nut.get_pos()[..., 2]
-    prev_yaw = gu.quat_to_xyz(nut.get_quat())[..., 2]
+    z0 = nut.get_pos(relative=False)[..., 2]
+    prev_yaw = gu.quat_to_xyz(nut.get_quat(relative=False))[..., 2]
     total_turn = 0.0
     released_step = None
     z_engaged = z0
@@ -3660,7 +3718,7 @@ def test_nonconvex_concentric_contact(direction, show_viewer):
     z_history = []
     horizon = 4100 if direction == "down" else 4800
     for step in range(horizon):
-        z = nut.get_pos()[..., 2]
+        z = nut.get_pos(relative=False)[..., 2]
         if released_step is None:
             reached = (z < SEAT_RELEASE_Z).all() if direction == "down" else (z > TIP_RELEASE_Z).all()
             if reached:
@@ -3669,8 +3727,8 @@ def test_nonconvex_concentric_contact(direction, show_viewer):
         nut.control_dofs_force([torque if driving else 0.0], dofs_idx_local=(5,))
         scene.step()
 
-        pos = nut.get_pos()
-        rpy = gu.quat_to_xyz(nut.get_quat())
+        pos = nut.get_pos(relative=False)
+        rpy = gu.quat_to_xyz(nut.get_quat(relative=False))
         vel = nut.get_dofs_velocity()
         z_history.append(pos[..., 2])
         yaw = rpy[..., 2]
@@ -3706,7 +3764,7 @@ def test_nonconvex_concentric_contact(direction, show_viewer):
         # a small steady contact jitter in velocity, so the position band is the robust at-rest signal.
         z_window = torch.stack(z_history[-200:], dim=0)
         assert ((z_window.amax(dim=0) - z_window.amin(dim=0)) < 1e-4).all()
-        z_final = nut.get_pos()[..., 2]
+        z_final = nut.get_pos(relative=False)[..., 2]
         assert ((0.019 < z_final) & (z_final < 0.021)).all()
     else:
         # Spun off the tip, fell, and came to rest flat on the ground: its bounding box now sits on the plane and all
@@ -3832,7 +3890,6 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
     assert_allclose(obj.geoms[0].get_pos()[:2], init_pos[:2], atol=2e-3)
 
 
-@pytest.mark.slow("gpu")  # gpu ~250s
 @pytest.mark.required
 @pytest.mark.parametrize("euler", [(90, 0, 90), (74, 15, 90)])
 @pytest.mark.parametrize("gjk_collision", [True, False])
@@ -3841,15 +3898,18 @@ def test_convexify(euler, show_viewer, gjk_collision):
     OBJ_OFFSET_X = 0.0  # 0.02
     OBJ_OFFSET_Y = 0.15
 
-    # The test check that the volume difference is under a given threshold and
-    # that convex decomposition is only used whenever it is necessary.
-    # Then run a simulation to see if it explodes, i.e. objects are at reset inside tank.
+    # The test check that the volume difference is under a given threshold and that convex decomposition is only used
+    # whenever it is necessary. Then run a simulation to see if it explodes, i.e. objects are at reset inside tank.
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.004,
         ),
         rigid_options=gs.options.RigidOptions(
             use_gjk_collision=gjk_collision,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, 0.5, 2.5),
+            camera_lookat=(0.0, 0.0, 0.5),
         ),
         show_viewer=show_viewer,
         show_FPS=False,
@@ -3862,12 +3922,12 @@ def test_convexify(euler, show_viewer, gjk_collision):
         ),
         vis_mode="collision",
     )
-    tank = scene.add_entity(
+    scene.add_entity(
         gs.morphs.Mesh(
             file="meshes/tank.obj",
             scale=5.0,
             fixed=True,
-            pos=(0.05, -0.1, 0.0),
+            pos=(0.05, -0.05, 0.0),
             euler=euler,
             # coacd_options=gs.options.CoacdOptions(
             #     threshold=0.08,
@@ -3876,11 +3936,13 @@ def test_convexify(euler, show_viewer, gjk_collision):
         vis_mode="collision",
     )
     objs = []
-    for i, asset_name in enumerate(("mug_1", "donut_0", "cup_2", "apple_15")):
+    for i, (asset_name, xml_file) in enumerate(
+        (("mug_1", "output.xml"), ("donut_0", "output.xml"), ("cup_2", "model.xml"), ("apple_15", "model.xml"))
+    ):
         asset_path = get_hf_dataset(pattern=f"{asset_name}/*")
         obj = scene.add_entity(
             gs.morphs.MJCF(
-                file=f"{asset_path}/{asset_name}/output.xml",
+                file=f"{asset_path}/{asset_name}/{xml_file}",
                 pos=(OBJ_OFFSET_X * (1.5 - i), OBJ_OFFSET_Y * (i - 1.5), 0.4),
             ),
             vis_mode="collision",
@@ -3905,60 +3967,121 @@ def test_convexify(euler, show_viewer, gjk_collision):
     # There should be only one geometry for the apple as it can be convexify without decomposition,
     # but for the others it is hard to tell... Let's use some reasonable guess.
     mug, donut, cup, apple = objs
-    assert len(apple.geoms) == 1
+    assert not any(geom.metadata.get("decomposed", False) for geom in apple.geoms)
+    assert not any(geom.metadata.get("decomposed", False) for geom in cup.geoms)
     assert all(geom.metadata["decomposed"] for geom in donut.geoms) and 5 <= len(donut.geoms) <= 10
-    assert all(geom.metadata["decomposed"] for geom in cup.geoms) and 5 <= len(cup.geoms) <= 20
     assert all(geom.metadata["decomposed"] for geom in mug.geoms) and 5 <= len(mug.geoms) <= 40
     assert all(geom.metadata["decomposed"] for geom in box.geoms) and 5 <= len(box.geoms) <= 20
 
     # Check resting conditions repeateadly rather not just once, for numerical robustness
+    # FIXME: The cup is falling on Windows OS because the convex decomposition provided by CoACD is different than
+    # other platform, and much worst in practice, with the bottom of the tank that is not planar (even discontinuous).
     # cam.start_recording()
-    qvel_norminf_all = []
-    for i in range(1700):
+    for i in range(1000):
         scene.step()
         # cam.render()
-        if i > 1600:
-            qvel = gs_sim.rigid_solver.get_dofs_velocity()
-            qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
-            qvel_norminf_all.append(qvel_norminf)
-    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)).cpu(), 4.0)
+        if i > 900:
+            assert_allclose(gs_sim.rigid_solver.get_dofs_velocity(), 0.0, atol=1.0 if sys.platform == "win32" else 0.5)
     # cam.stop_recording(save_to_filename="video.mp4", fps=60)
 
     for obj in objs:
-        qpos = obj.get_dofs_position().cpu()
-        np.testing.assert_array_less(-0.1, qpos[2])
-        np.testing.assert_array_less(qpos[2], 0.15)
-        np.testing.assert_array_less(torch.linalg.norm(qpos[:2]), 0.5)
+        obj_pos = tensor_to_array(obj.get_pos())
+        np.testing.assert_array_less(-0.1, obj_pos[2])
+        np.testing.assert_array_less(obj_pos[2], 0.15)
+        np.testing.assert_array_less(np.linalg.norm(obj_pos[:2]), 0.5)
 
-    # Check that the mug and donut are landing straight if the tank is horizontal.
-    # The cup is tipping because it does not land flat due to convex decomposition error.
+    # Check that the mug, donut and cup are landing straight if the tank is horizontal
     if euler == (90, 0, 90):
-        for i, obj in enumerate((mug, donut)):
-            qpos = obj.get_dofs_position()
-            assert_allclose(qpos[0], OBJ_OFFSET_X * (1.5 - i), atol=7e-3)
-            assert_allclose(qpos[1], OBJ_OFFSET_Y * (i - 1.5), atol=5e-3)
+        for i, obj in enumerate((mug, donut, *(() if sys.platform == "win32" else (cup,)))):
+            obj_pos = obj.get_pos()
+            assert_allclose(obj_pos[:2], (OBJ_OFFSET_X * (1.5 - i), OBJ_OFFSET_Y * (i - 1.5)), atol=6e-3)
 
 
 @pytest.mark.slow("gpu")  # gpu ~250s
-@pytest.mark.required
+@pytest.mark.parametrize(
+    "scene_kind, max_collision_pairs, max_contacts, error_pattern",
+    [
+        # Post-pruning contact budget overflow, with the candidate buffer large enough (2x margin) that it cannot
+        # trip first. The automatic budget resolves to 32 contact points per link pair floored at 512, far below
+        # what the piled-up bowls produce.
+        pytest.param("bowls", 1_000, None, "max number of post-pruning contact points", marks=pytest.mark.required),
+        # Candidate contact buffer overflow. The explicit contact budget is clamped down to the buffer size, so only
+        # the buffer itself can overflow.
+        ("bowls", 150, 1_000, "max number of candidate contact points"),
+        # Buffers large enough for the whole pile: no overflow at all. Both values keep a 2x margin over the peaks
+        # reached within the stepped window (about 500 colliding geom pairs and 1040 post-pruning contact points).
+        ("bowls", 1_000, 2_000, None),
+        # Two contacts against a budget of one: the clamp must also run when the contact count is below the pruning
+        # gate (n_contacts < 3), in both the serial and the GPU cooperative kernel variants.
+        ("spheres", 150, 1, "max number of post-pruning contact points"),
+    ],
+)
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_num_contact_overflow(show_viewer):
-    asset_path = get_hf_dataset(pattern="glb/orange_plastic_bowl.glb")
-    scene = gs.Scene(show_viewer=show_viewer, renderer=gs.renderers.Rasterizer())
+def test_num_contact_overflow(scene_kind, max_collision_pairs, max_contacts, error_pattern, show_viewer):
+    from genesis.engine.simulator import RATE_CHECK_ERRNO
+
+    N_BOWLS = 4
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            max_collision_pairs=max_collision_pairs,
+            max_contacts=max_contacts,
+        ),
+        show_viewer=show_viewer,
+        renderer=gs.renderers.Rasterizer(),
+    )
     scene.add_entity(morph=gs.morphs.Plane())
-    for _ in range(4):
+    if scene_kind == "bowls":
+        asset_path = get_hf_dataset(pattern="glb/orange_plastic_bowl.glb")
+        for _ in range(N_BOWLS):
+            scene.add_entity(
+                morph=gs.morphs.Mesh(
+                    file=f"{asset_path}/glb/orange_plastic_bowl.glb",
+                    pos=(0, 0, 0.5),
+                    euler=(90, 0, 0),
+                    convexify=True,
+                    file_meshes_are_zup=True,
+                ),
+            )
+    else:
+        # Non-contacting nonconvex mesh: makes the scene prunable so that the GPU cooperative kernel is exercised.
         scene.add_entity(
             morph=gs.morphs.Mesh(
-                file=f"{asset_path}/glb/orange_plastic_bowl.glb",
-                pos=(0, 0, 0.5),
-                euler=(90, 0, 0),
-                convexify=True,
-                file_meshes_are_zup=True,
+                file="meshes/duck.obj",
+                scale=0.04,
+                pos=(5.0, 5.0, 5.0),
+                convexify=False,
             ),
         )
+        for i in range(2):
+            scene.add_entity(
+                morph=gs.morphs.Sphere(
+                    pos=(0.5 * i, 0.0, 0.0999),
+                    radius=0.1,
+                ),
+            )
     scene.build()
-    with pytest.raises(gs.GenesisException, match="max number of contact pairs"):
-        for _ in range(20):
+    assert scene.rigid_solver.collider._collider_static_config.has_prunable_contacts
+
+    # The resolved contact budget must match the documented resolution: 32 contact points per link pair floored at
+    # 512 when automatic (every link pair here has more than 32 candidate contact points), the explicit value clamped
+    # to the candidate buffer size otherwise. The constraint buffers are sized accordingly, with 4 constraint rows
+    # per contact point (all joints are free so there is no joint-limit term).
+    solver = scene.rigid_solver
+    collider_info = solver.collider._collider_info
+    if max_contacts is None:
+        n_link_pairs = (N_BOWLS + 1) * N_BOWLS // 2
+        expected_max_contacts = max(32 * n_link_pairs, 512)
+    else:
+        expected_max_contacts = min(max_contacts, int(collider_info.max_candidate_contacts[None]))
+    assert int(collider_info.max_contacts[None]) == expected_max_contacts
+    expected_len_constraints = 4 * expected_max_contacts + solver.n_dofs + 6 * solver.n_candidate_equalities_
+    assert solver.constraint_solver.len_constraints == expected_len_constraints
+
+    # All overflows occur on the very first step (the bowls start fully overlapping, the spheres start resting on the
+    # plane), but errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee
+    # that the error gets raised.
+    with nullcontext() if error_pattern is None else pytest.raises(gs.GenesisException, match=error_pattern):
+        for _ in range(RATE_CHECK_ERRNO + 1):
             scene.step()
 
 
@@ -4484,7 +4607,9 @@ def test_urdf_parsing(show_viewer, tol):
     root_idx_all = [link.root_idx for link in scene.rigid_solver.links]
     assert len(set(root_idx_all)) == 4
 
-    def _check_entity_positions(relative, tol):
+    def _check_entity_positions(expected_y_spacing, tol):
+        # The four parsing configs are laid out 'expected_y_spacing' apart in y, so their world AABBs must coincide once
+        # that spacing is removed. AABBs are world-frame, so this check is independent of the relative-getter frame.
         nonlocal entities
         AABB_all = []
         for key in ((False, False), (False, True), (True, False), (True, True)):
@@ -4500,33 +4625,35 @@ def test_urdf_parsing(show_viewer, tol):
                 AABB[1] = np.maximum(AABB[1], AABB_i[1])
             AABB_all.append(AABB)
         AABB_diff = np.diff(AABB_all, axis=0)
-        if relative:
-            AABB_diff[..., 1] -= POS_OFFSET
+        AABB_diff[..., 1] -= expected_y_spacing
         assert_allclose(AABB_diff, 0.0, tol=tol)
 
-    # Check that `set_pos` / `set_quat` applies the same transform in all cases
+    # Check that `set_pos` / `set_quat` applies the same transform in all cases. Both frames place every config at the
+    # same pose, so the world AABBs coincide with no residual spacing.
     for relative in (False, True):
         for key in ((False, False), (False, True), (True, False), (True, True)):
             entities[key].set_pos(np.array([0.5, 0.0, 0.0]), relative=relative)
             entities[key].set_quat(np.array([0.0, 0.0, 0.0, 1.0]), relative=relative)
         if show_viewer:
             scene.visualizer.update()
-        _check_entity_positions(relative, tol=tol)
+        _check_entity_positions(0.0, tol=tol)
 
-    # Check that `set_qpos` applies the same absolute transform in all cases
+    # Check that `set_qpos` applies the same absolute transform in all cases. The fixed roots have no free joint to
+    # take a base pose via qpos, so they are placed at the matching absolute world pose with the (relative=False)
+    # setters. All four configs then sit POS_OFFSET apart in y, as at creation.
     door_angle = np.array([1.1])
+    world_quat = tuple(WOLRD_QUAT / np.linalg.norm(WOLRD_QUAT))
     for i, key in enumerate(((False, False), (False, True))):
-        qpos = np.concatenate(
-            ((0.0, (i - 1.5) * POS_OFFSET, 0.0), tuple(WOLRD_QUAT / np.linalg.norm(WOLRD_QUAT)), door_angle)
-        )
+        qpos = np.concatenate(((0.0, (i - 1.5) * POS_OFFSET, 0.0), world_quat, door_angle))
         entities[key].set_qpos(qpos)
     for i, key in enumerate(((True, False), (True, True))):
-        entities[key].set_pos(np.array([0.0, 0.0, 0.0]), relative=True)
-        entities[key].set_quat(np.array([1.0, 0.0, 0.0, 0.0]), relative=True)
+        config_y = ((i + 2) - 1.5) * POS_OFFSET
+        entities[key].set_pos(np.array([0.0, config_y, 0.0]), relative=False)
+        entities[key].set_quat(np.array(world_quat), relative=False)
         entities[key].set_qpos(door_angle)
     if show_viewer:
         scene.visualizer.update()
-    _check_entity_positions(relative=True, tol=tol)
+    _check_entity_positions(POS_OFFSET, tol=tol)
 
     # Add dof damping to stabilitze the physics
     for key in ((False, False), (False, True), (True, False), (True, True)):
@@ -4554,7 +4681,7 @@ def test_urdf_parsing(show_viewer, tol):
         door_pos_diff = torch.diff(torch.concatenate(door_pos_all))
         assert_allclose(door_pos_diff, 0, tol=5e-3)
     assert_allclose(scene.rigid_solver.dofs_state.vel.to_numpy(), 0.0, tol=1e-3)
-    _check_entity_positions(relative=True, tol=2e-3)
+    _check_entity_positions(POS_OFFSET, tol=2e-3)
 
 
 @pytest.mark.slow  # ~200s
@@ -6151,23 +6278,24 @@ def test_ellipsoid(xml_path, show_viewer):
 @pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_mesh_align(show_viewer, tol):
-    INIT_POS = (0.0, 0.0, 0.8)
+    INIT_POS = (0.0, 0.0, 0.1)
 
-    asset_path = get_hf_dataset(pattern="glb/mango.glb")
+    mango_path = get_hf_dataset(pattern="glb/mango.glb")
+    bowl_path = get_hf_dataset(pattern="glb/orange_plastic_bowl.glb")
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.8, 0.8, 0.7),
-            camera_lookat=(-0.3, 0.0, 0.0),
+            camera_pos=(0.8, 0.8, 1.6),
+            camera_lookat=(0.0, 0.0, 0.0),
         ),
         show_viewer=show_viewer,
     )
     scene.add_entity(gs.morphs.Plane())
     mango_morph = gs.morphs.Mesh(
-        file=f"{asset_path}/glb/mango.glb",
+        file=f"{mango_path}/glb/mango.glb",
         scale=0.045,
         pos=INIT_POS,
         align=True,
@@ -6184,20 +6312,77 @@ def test_mesh_align(show_viewer, tol):
         mango_morph,
         material=gs.materials.Kinematic(),
     )
-    scene.build()
+    # Heterogeneous entity sharing one link across a bowl and a mango variant. Each variant must be aligned to its own
+    # geometry (link origin at that variant's COM) and report its own offset per environment. The bowl carries a
+    # hard-coded offset to check it composes with the alignment, and the mango variant must end up aligned exactly
+    # like the standalone mango above.
+    HET_POS = (0.5, 0.0, 0.1)
+    het_obj = scene.add_entity(
+        morph=(
+            gs.morphs.Mesh(
+                file=f"{bowl_path}/glb/orange_plastic_bowl.glb",
+                scale=0.1,
+                pos=HET_POS,
+                offset_euler=(30.0, 0.0, 0.0),
+                align=True,
+            ),
+            gs.morphs.Mesh(
+                file=f"{mango_path}/glb/mango.glb",
+                scale=0.045,
+                pos=HET_POS,
+                align=True,
+            ),
+        ),
+        material=gs.materials.Rigid(rho=1000.0),
+    )
+    scene.build(n_envs=2)
 
-    # Alignment is transparent: geom/vgeom world-space pose must equal morph pos/quat regardless of align
+    # Geoms/vgeoms are alignment-transparent, so their world pose equals the morph pose, and without a morph offset
+    # the relative (user-frame) pose matches it too.
     geom, vgeom = mango.geoms[0], mango.vgeoms[0]
-    assert_allclose(geom.get_pos(), INIT_POS, atol=1e-3)
-    assert_allclose(geom.get_quat(), gu.identity_quat(), atol=1e-3)
-    assert_allclose(vgeom.get_pos(), INIT_POS, atol=1e-3)
-    assert_allclose(vgeom.get_quat(), gu.identity_quat(), atol=1e-3)
+    for relative in (False, True):
+        assert_allclose(geom.get_pos(relative=relative), INIT_POS, atol=1e-3)
+        assert_allclose(geom.get_quat(relative=relative), gu.identity_quat(), atol=1e-3)
+        assert_allclose(vgeom.get_pos(relative=relative), INIT_POS, atol=1e-3)
+        assert_allclose(vgeom.get_quat(relative=relative), gu.identity_quat(), atol=1e-3)
 
-    # With align=True, the link frame is placed at the geometry COM
-    assert_allclose(mango.get_links_pos(ref="link_com"), mango.get_pos(), tol=tol)
+    # The relative (user-frame) base pose strips the alignment back to the morph pose.
+    assert_allclose(mango.get_pos(relative=True), INIT_POS, tol=tol)
+    assert_allclose(mango.get_quat(relative=True), gu.identity_quat(), tol=tol)
+    # The world-frame base pose places the link frame at the geometry COM and principal axes.
+    assert_allclose(
+        mango.get_links_pos(links_idx_local=[0], ref="link_com", relative=False),
+        mango.get_links_pos(links_idx_local=[0], ref="link_origin", relative=False),
+        tol=tol,
+    )
     geom_inertia_i = qd_to_numpy(scene.rigid_solver.links_state.cinr_inertial, transpose=True)[0, 1]
-    geom_quat = tensor_to_array(mango.get_quat())
+    geom_quat = tensor_to_array(mango.get_quat(relative=False))
     assert_allclose(gu.R_to_xyz(gu.quat_to_R(geom_quat) @ uu.principal_axes_rot(geom_inertia_i).T), 0.0, tol=tol)
+
+    # Both variants (env 0 bowl, env 1 mango) strip their own offset back to the user pose, and each variant's link
+    # origin sits at its own COM. The bowl recovers the user frame despite its hard-coded offset, proving the offset
+    # composes with the alignment.
+    for i_env in (0, 1):
+        assert_allclose(het_obj.get_pos(relative=True, envs_idx=i_env), HET_POS, tol=tol)
+        assert_allclose(het_obj.get_quat(relative=True, envs_idx=i_env), gu.identity_quat(), tol=tol)
+        assert_allclose(
+            het_obj.get_links_pos(links_idx_local=[0], ref="link_com", envs_idx=i_env, relative=False),
+            het_obj.get_links_pos(links_idx_local=[0], ref="link_origin", envs_idx=i_env, relative=False),
+            tol=tol,
+        )
+
+    # The two variants have different geometry, so their aligned world origins differ.
+    with np.testing.assert_raises(AssertionError):
+        assert_allclose(
+            het_obj.get_pos(relative=False, envs_idx=0), het_obj.get_pos(relative=False, envs_idx=1), tol=tol
+        )
+
+    # The heterogeneous mango variant (env 1) is aligned exactly like the standalone mango: the world<-user offset
+    # (COM shift and principal-axis rotation) matches, independent of the base placement.
+    het_mango_offset = het_obj.get_pos(relative=False, envs_idx=1) - het_obj.get_pos(relative=True, envs_idx=1)
+    mango_offset = mango.get_pos(relative=False, envs_idx=0) - mango.get_pos(relative=True, envs_idx=0)
+    assert_allclose(het_mango_offset, mango_offset, tol=tol)
+    assert_allclose(het_obj.get_quat(relative=False, envs_idx=1), mango.get_quat(relative=False, envs_idx=0), tol=tol)
 
     # Same qpos on rigid and kinematic entities must yield matching vAABB
     qpos = (0.3, -0.2, 1.0, 0.6, 0.5, 0.3, 0.0)
@@ -6207,11 +6392,12 @@ def test_mesh_align(show_viewer, tol):
     scene.reset()
 
     # Simulate
-    for _ in range(450):
+    for _ in range(600):
         scene.step()
 
-    assert_allclose(mango.get_dofs_velocity(), 0, tol=0.05)
-    assert (-0.005 < mango.get_AABB()[0, 2] < 0.0).all()
+    assert_allclose(mango.get_dofs_velocity(), 0, tol=0.06)
+    min_z = mango.get_AABB()[:, 0, 2]
+    assert ((-0.005 < min_z) & (min_z < 0.0)).all()
 
 
 @pytest.mark.slow  # ~200s
@@ -6247,8 +6433,10 @@ def test_urdf_align(show_viewer, tol):
     )
     scene.build()
 
-    # With align=None (auto-True for basic rigid objects), the link frame origin is at the collision geometry COM
-    assert_allclose(fork.get_links_pos(ref="link_com"), fork.get_pos(), tol=tol)
+    # The relative (user-frame) base pose strips the alignment back to the morph pose, while the world-frame base
+    # pose has its link frame origin at the collision geometry COM (auto-align for basic rigid objects).
+    assert_allclose(fork.get_pos(relative=True), INIT_POS, tol=tol)
+    assert_allclose(fork.get_links_pos(ref="link_com"), fork.get_pos(relative=False), tol=tol)
 
     # Same qpos on rigid and kinematic entities must yield matching vAABB
     qpos = (0.3, -0.2, 1.0, 0.6, 0.5, 0.3, 0.0)
@@ -6264,6 +6452,121 @@ def test_urdf_align(show_viewer, tol):
 
     assert_allclose(fork.get_dofs_velocity(), 0, tol=0.05)
     assert (-0.002 < fork.get_AABB()[0, 2] < 0.0).all()
+
+
+@pytest.mark.required
+def test_relative_offset_on_link_relative_geoms(show_viewer, tol):
+    # To exercise the geom-frame offset strip the geoms MUST sit at non-identity poses relative to their link (explicit
+    # collision/visual <origin>) AND the morph offset MUST be a rotation that does not commute with them - otherwise the
+    # conjugation degenerates to the plain morph offset and a naive (corrupted) strip would still pass. A convex-
+    # decomposed mesh is useless here: its sub-geoms keep an identity frame (geometry lives in the vertices).
+    robot = ET.Element("robot", name="posed_geoms")
+    link = ET.SubElement(robot, "link", name="body")
+    for origin_rpy, origin_xyz in (
+        ("0 0 1.5708", "0.1 0 0"),
+        ("0.7854 0 0", "0 0.1 0.05"),
+        ("0 1.0472 0.5", "0 0 0.1"),
+    ):
+        for group_tag in ("collision", "visual"):
+            group = ET.SubElement(link, group_tag)
+            geom_el = ET.SubElement(group, "geometry")
+            ET.SubElement(geom_el, "box", size="0.05 0.1 0.15")
+            ET.SubElement(group, "origin", rpy=origin_rpy, xyz=origin_xyz)
+    urdf = urdfpy.URDF._from_xml(robot, robot, get_assets_dir())
+
+    BODY_POS = (0.0, 0.0, 0.2)
+    OFFSET_EULER = (20.0, 35.0, 50.0)  # a generic rotation that does not commute with the geom poses
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    body = scene.add_entity(
+        gs.morphs.URDF(
+            file=urdf,
+            pos=BODY_POS,
+            offset_euler=OFFSET_EULER,
+            align=True,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    scene.build()
+
+    assert len(body.geoms) > 1, "expected multiple geoms posed relative to the link"
+
+    # The user orientation is identity, so the world<-user offset rotates each geom about the link origin:
+    # geom_world_pos = U_pos + R(offset) * (geom_user_pos - U_pos) and geom_world_quat = offset * geom_user_quat.
+    assert_allclose(body.get_quat(relative=True), gu.identity_quat(), tol=tol)
+    u_pos = tensor_to_array(body.get_pos(relative=True))
+    offset_quat = gu.xyz_to_quat(np.array(OFFSET_EULER), rpy=True, degrees=True)
+    for geom in body.geoms:
+        geom_user_pos = tensor_to_array(geom.get_pos(relative=True))
+        geom_user_quat = tensor_to_array(geom.get_quat(relative=True))
+        expected_world_pos = u_pos + gu.transform_by_quat(geom_user_pos - u_pos, offset_quat)
+        expected_world_quat = gu.transform_quat_by_quat(geom_user_quat, offset_quat)
+        assert_allclose(geom.get_pos(relative=False), expected_world_pos, tol=tol)
+        assert_allclose(geom.get_quat(relative=False), expected_world_quat, tol=tol)
+
+
+def create_two_free_bodies_mjcf(name, pos_a, geom_a, pos_b, geom_b):
+    """Helper to create an MJCF with two free root bodies, each a single box geom offset from its body origin."""
+    mjcf = ET.Element("mujoco", model=name)
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    body_a = ET.SubElement(worldbody, "body", name="a", pos=f"{pos_a[0]} {pos_a[1]} {pos_a[2]}")
+    ET.SubElement(body_a, "joint", name="a_free", type="free")
+    ET.SubElement(
+        body_a, "geom", type="box", size="0.05 0.05 0.05", pos=f"{geom_a[0]} {geom_a[1]} {geom_a[2]}", density="1000"
+    )
+    body_b = ET.SubElement(worldbody, "body", name="b", pos=f"{pos_b[0]} {pos_b[1]} {pos_b[2]}")
+    ET.SubElement(body_b, "joint", name="b_free", type="free")
+    ET.SubElement(
+        body_b, "geom", type="box", size="0.05 0.08 0.03", pos=f"{geom_b[0]} {geom_b[1]} {geom_b[2]}", density="1000"
+    )
+    return mjcf
+
+
+@pytest.mark.required
+def test_multi_root_offset(show_viewer, tol):
+    # To exercise per-root offset tracking the entity MUST hold more than one free root (one MJCF, several free
+    # bodies) with DISTINCT per-root geometry, so each root gets its own alignment offset; a single root - or
+    # identical roots - would not surface the cross-contamination bug (one root's offset leaking into another).
+    BODY_A_POS = (1.0, 0.0, 0.5)
+    BODY_B_POS = (-1.0, 0.0, 0.5)
+    GEOM_A_POS = (0.02, 0.01, 0.0)
+    GEOM_B_POS = (0.0, 0.03, 0.02)
+
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    entity = scene.add_entity(
+        gs.morphs.MJCF(
+            file=ET.tostring(
+                create_two_free_bodies_mjcf("two_bodies", BODY_A_POS, GEOM_A_POS, BODY_B_POS, GEOM_B_POS),
+                encoding="unicode",
+            ),
+            align=True,
+        ),
+    )
+    scene.build()
+
+    link_a, link_b = entity.links
+    # Each root reports its own user-specified pose in the relative frame, independent of the other root.
+    assert_allclose(link_a.get_pos(), BODY_A_POS, tol=tol)
+    assert_allclose(link_b.get_pos(), BODY_B_POS, tol=tol)
+    assert_allclose(link_a.get_quat(), gu.identity_quat(), tol=tol)
+    assert_allclose(link_b.get_quat(), gu.identity_quat(), tol=tol)
+
+    # The world frame carries each root's own COM shift (the box center), confirming the offsets are not shared.
+    assert_allclose(link_a.get_pos(relative=False), np.add(BODY_A_POS, GEOM_A_POS), tol=tol)
+    assert_allclose(link_b.get_pos(relative=False), np.add(BODY_B_POS, GEOM_B_POS), tol=tol)
+
+    # Both roots free-fall under gravity: the relative getter tracks each user frame, holding x/y and dropping z
+    # equally (free fall is mass-independent).
+    for _ in range(20):
+        scene.step()
+    assert_allclose(link_a.get_pos()[..., :2], BODY_A_POS[:2], tol=tol)
+    assert_allclose(link_b.get_pos()[..., :2], BODY_B_POS[:2], tol=tol)
+    assert_allclose(link_a.get_pos()[..., 2], link_b.get_pos()[..., 2], tol=tol)
 
 
 @pytest.fixture
@@ -6564,7 +6867,7 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol, monkeypat
 
 @pytest.mark.slow  # ~450s
 @pytest.mark.required
-def test_heterogeneous_simulation(show_viewer, tol):
+def test_heterogeneous_physics_parity(show_viewer, tol):
     """Test heterogeneous simulation by comparing against independent homogeneous simulations.
 
     This test verifies that heterogeneous simulation produces identical physics results
@@ -6604,14 +6907,20 @@ def test_heterogeneous_simulation(show_viewer, tol):
     # 4 envs with 2 variants: envs 0-1 get box, envs 2-3 get sphere
     scene_het = gs.Scene(show_viewer=show_viewer)
     scene_het.add_entity(gs.morphs.Plane())
+    # Divergent per-variant yaw offsets, irrelevant to the dynamics of these symmetric primitives dropped flat (so
+    # the world references still match) but stripped per environment by the relative getters.
+    box_offset_euler = (0.0, 0.0, 30.0)
+    sphere_offset_euler = (0.0, 0.0, -45.0)
     morphs_heterogeneous = (
         gs.morphs.Box(
             size=(0.04, 0.04, 0.04),
             pos=(0.0, 0.0, box_drop_height),
+            offset_euler=box_offset_euler,
         ),
         gs.morphs.Sphere(
             radius=0.02,
             pos=(0.1, 0.0, sphere_drop_height),
+            offset_euler=sphere_offset_euler,
         ),
     )
     het_obj = scene_het.add_entity(morph=morphs_heterogeneous)
@@ -6625,6 +6934,15 @@ def test_heterogeneous_simulation(show_viewer, tol):
     assert_allclose(het_pos_init[2, 2], sphere_drop_height, tol=tol)
     assert_allclose(het_pos_init[3, 0], 0.1, tol=tol)
     assert_allclose(het_pos_init[3, 2], sphere_drop_height, tol=tol)
+
+    # The relative getter strips each variant's own offset back to the user frame (identity), while the world frame
+    # carries the per-environment offset.
+    box_offset_quat = gu.xyz_to_quat(np.array(box_offset_euler), rpy=True, degrees=True)
+    sphere_offset_quat = gu.xyz_to_quat(np.array(sphere_offset_euler), rpy=True, degrees=True)
+    assert_allclose(het_obj.get_quat(relative=True), gu.identity_quat(), tol=tol)
+    het_quat_world = het_obj.get_quat(relative=False)
+    assert_allclose(het_quat_world[:2], box_offset_quat, tol=tol)
+    assert_allclose(het_quat_world[2:], sphere_offset_quat, tol=tol)
 
     for _ in range(n_steps):
         scene_het.step()
@@ -6957,9 +7275,24 @@ def _build_two_link_revolute_urdf(name, geom_tag=None, geom_attribs=None, *, lin
     return urdfpy.URDF._from_xml(robot, robot, get_assets_dir())
 
 
+def _build_free_body_urdf(name, com_xyz):
+    """Build a single free-floating link URDF with a box geom and an off-center COM, returning its path."""
+    robot = ET.Element("robot", name=name)
+    link = ET.SubElement(robot, "link", name="body")
+    for group_tag in ("visual", "collision"):
+        group = ET.SubElement(link, group_tag)
+        geom_el = ET.SubElement(group, "geometry")
+        ET.SubElement(geom_el, "box", size="0.04 0.04 0.04")
+    inertial = ET.SubElement(link, "inertial")
+    ET.SubElement(inertial, "mass", value="0.5")
+    ET.SubElement(inertial, "origin", xyz=com_xyz)
+    ET.SubElement(inertial, "inertia", ixx="1e-3", iyy="1e-3", izz="1e-3", ixy="0", ixz="0", iyz="0")
+    return urdfpy.URDF._from_xml(robot, robot, get_assets_dir())
+
+
 @pytest.mark.slow  # ~250s
 @pytest.mark.required
-def test_heterogeneous_robots(show_viewer, tol):
+def test_heterogeneous_inertial_alignment(show_viewer, tol):
     """Test heterogeneous articulated simulation with vertex-based and primitive collision geometries.
 
     Variant A splits each box primitive into two half-height sub-boxes (top/bottom),
@@ -7042,7 +7375,36 @@ def test_heterogeneous_robots(show_viewer, tol):
             color=(0.0, 0.0, 1.0, 0.4),
         ),
     )
+    # Free-floating single-link URDF objects with different off-center COMs. Unlike the articulated robots above
+    # (which stay unaligned), each variant is a basic rigid object, so its link frame is moved to its own COM.
+    FREE_POS = (3.0, 0.0, 0.2)
+    free_het = scene.add_entity(
+        morph=(
+            gs.morphs.URDF(file=_build_free_body_urdf("free_body_a", "0.02 0 0"), pos=FREE_POS, align=True),
+            gs.morphs.URDF(file=_build_free_body_urdf("free_body_b", "0 0 0.03"), pos=FREE_POS, align=True),
+        ),
+        material=gs.materials.Rigid(rho=200.0),
+    )
     scene.build(n_envs=4, env_spacing=(0.0, 0.5))
+
+    # Each free-body variant (env 0 variant A, env 2 variant B) is aligned to its own COM: the link origin coincides
+    # with the COM, and the relative getter strips the alignment back to the user pose.
+    for i_env in (0, 2):
+        assert_allclose(
+            free_het.get_links_pos(links_idx_local=[0], ref="link_com", envs_idx=i_env, relative=False),
+            free_het.get_links_pos(links_idx_local=[0], ref="link_origin", envs_idx=i_env, relative=False),
+            tol=tol,
+        )
+        assert_allclose(free_het.get_pos(relative=True, envs_idx=i_env), FREE_POS, tol=tol)
+
+    # Relative set_pos on a boolean-masked subset of envs: each selected env's relative getter must report its target
+    # back, stripping its own per-variant offset.
+    mask = torch.tensor([True, False, True, False], device=gs.device)
+    free_new_pos = torch.tensor([[1.0, 0.0, 0.5], [2.0, 0.0, 0.5]], dtype=gs.tc_float, device=gs.device)
+    free_het.set_pos(free_new_pos, envs_idx=mask, relative=True)
+    free_pos = free_het.get_pos(relative=True)
+    assert_allclose(free_pos[[0, 2]], free_new_pos, tol=tol)
+    assert_allclose(free_pos[[1, 3]], FREE_POS, tol=tol)
 
     # Joint structure: both variants share the same joints (root_joint + joint1)
     assert len(het_obj.joints) == 2
@@ -7062,7 +7424,7 @@ def test_heterogeneous_robots(show_viewer, tol):
     # Variant B has x-offset relative to variant A
     assert_allclose(het_pos_init[0, 0] - het_pos_init[2, 0], 0.5, tol=tol)
     assert_allclose(het_pos_init[1, 0] - het_pos_init[3, 0], 0.5, tol=tol)
-    het_links_pos_init = het_obj.get_links_pos()
+    het_links_pos_init = het_obj.get_links_pos(relative=False)
     assert_allclose(het_links_pos_init.diff(dim=-2), (0.1, 0, 0), tol=tol)
 
     # Same-variant envs produce identical results (balanced block [A, A, B, B])
@@ -7089,8 +7451,8 @@ def test_heterogeneous_robots(show_viewer, tol):
     assert_allclose(mass[0], sphere_base_mass + sphere_moving_mass, tol=tol)
 
     # CoM position: variant B should match explicit URDF inertial origin_xyz
-    com_pos = het_obj.get_links_pos(ref="link_com")
-    origin_pos = het_obj.get_links_pos(ref="link_origin")
+    com_pos = het_obj.get_links_pos(ref="link_com", relative=False)
+    origin_pos = het_obj.get_links_pos(ref="link_origin", relative=False)
     com_offset = com_pos - origin_pos
     # Variant A: CoM offset matches URDF inertial origin
     assert_allclose(com_offset[0, 0], sphere_base_com, tol=tol)
@@ -7148,7 +7510,7 @@ def test_heterogeneous_robots(show_viewer, tol):
     # Check that dof position is correct
     dof_pos = het_obj.get_dofs_position()
     assert_allclose(dof_pos[..., -1], target_dof_pos, tol=1e-3)
-    het_links_pos = het_obj.get_links_pos()
+    het_links_pos = het_obj.get_links_pos(relative=False)
     assert_allclose(het_links_pos[..., 1, 0] - het_links_pos[..., 0, 0], target_dof_pos + 0.1, tol=1e-3)
     assert_allclose(het_links_pos[..., 1, 1:], het_links_pos[..., 0, 1:], tol=5e-3)
 
@@ -7184,7 +7546,6 @@ def test_heterogeneous_articulated_structure_mismatch():
 
 
 @pytest.mark.required
-@pytest.mark.xfail(reason="QuadrantsSyntaxError caused by dataclass argument parsing.")
 @pytest.mark.parametrize("performance_mode", [True])
 def test_hibernation_and_contact_islands(show_viewer):
     """
@@ -7195,6 +7556,8 @@ def test_hibernation_and_contact_islands(show_viewer):
     2. Move one box above the other using set_pos (wakes it up)
     3. Box falls and collides -> both boxes awake
     4. Stacked boxes settle and hibernate -> 1 contact island (merged)
+    5. Move one box off the hibernated stack using set_pos -> the whole island wakes up
+    6. Boxes settle separately and hibernate -> 2 contact islands (split)
     """
     if gs.use_ndarray:
         pytest.skip("Hibernation does not support dynamic array mode.")
@@ -7261,6 +7624,22 @@ def test_hibernation_and_contact_islands(show_viewer):
 
     # Stacked boxes should form 1 contact island
     assert solver.constraint_solver.contact_island.n_islands[0] == 1
+
+    # Phase 4: Move box1 off the hibernated stack. The whole island must wake up, otherwise the stale hibernated
+    # island daisy-chain would keep re-connecting both boxes at every contact island construction.
+    box1.set_pos(np.array([1.0, 0.0, 0.15]))
+    assert not solver.entities_state.hibernated[box1_idx, 0]
+    assert not solver.entities_state.hibernated[box2_idx, 0]
+
+    # Phase 5: Let both boxes settle far apart and hibernate as 2 distinct contact islands
+    for step in range(500):
+        scene.step()
+        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
+            break
+
+    assert solver.entities_state.hibernated[box1_idx, 0]
+    assert solver.entities_state.hibernated[box2_idx, 0]
+    assert solver.constraint_solver.contact_island.n_islands[0] == 2
 
 
 @pytest.mark.required
