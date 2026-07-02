@@ -64,9 +64,7 @@ class ConstraintSolver:
         self._para_level = rigid_solver._para_level
 
         self._solver_type = rigid_solver._options.constraint_solver
-        self._n_iterations = int(
-            rigid_solver._options.iterations
-        )  # Python-native; passed to Python-scope functions to avoid CPU-GPU sync
+        self._n_iterations = int(rigid_solver._options.iterations)
         self.tolerance = rigid_solver._options.tolerance
         self.ls_iterations = rigid_solver._options.ls_iterations
         self.ls_tolerance = rigid_solver._options.ls_tolerance
@@ -1924,18 +1922,22 @@ def func_compute_island_envelope(
     for ld in range(n):
         island_state.dof_env_start_local[dof_base + ld, i_b] = ld
 
-    # Constraint coupling: scanning the island's DOFs in ascending order, the first DOF a constraint touches is its
-    # smallest local column and bounds the envelope of every other DOF it touches.
+    # Constraint coupling: a constraint's smallest live (|jac| > EPS) local DOF bounds the envelope of every other live
+    # DOF it touches. Iterate the constraint's own support (jac_dofs_idx, mapped to island-local positions via
+    # dof_local_pos) rather than scanning the whole island - O(support) instead of O(island size). The |jac| > EPS test
+    # matches the whole-island scan it replaces and the assembly's outer guard, so DOFs that are structurally in the
+    # support but currently have a zero Jacobian column are excluded identically, keeping the envelope deterministic.
     for i_lcon in range(con_n):
         i_c = island_state.constraint_id[con_base + i_lcon, i_b]
         col_min = n
-        for ld in range(n):
-            i_dg = island_state.dof_id[dof_base + ld, i_b]
-            if qd.abs(constraint_state.jac[i_c, i_dg, i_b]) > EPS:
-                if col_min == n:
-                    col_min = ld
-                elif col_min < island_state.dof_env_start_local[dof_base + ld, i_b]:
-                    island_state.dof_env_start_local[dof_base + ld, i_b] = col_min
+        for k_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+            ld = island_state.dof_local_pos[constraint_state.jac_dofs_idx[i_c, k_, i_b], i_b]
+            if ld < col_min:
+                col_min = ld
+        for k_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+            ld = island_state.dof_local_pos[constraint_state.jac_dofs_idx[i_c, k_, i_b], i_b]
+            if col_min < island_state.dof_env_start_local[dof_base + ld, i_b]:
+                island_state.dof_env_start_local[dof_base + ld, i_b] = col_min
 
     # Mass coupling: the kinematic-tree mask is directional (descendant -> ancestor) plus full intra-link, so check
     # both orientations. DOFs are ascending, so the first coupled lower column is the smallest.
@@ -1950,6 +1952,17 @@ def func_compute_island_envelope(
                 if ld2 < island_state.dof_env_start_local[dof_base + ld, i_b]:
                     island_state.dof_env_start_local[dof_base + ld, i_b] = ld2
                 break
+
+    # Transpose the envelope into per-column heights: col_end[c] = max row whose envelope reaches column c. The
+    # column-oriented sweeps (rank-1 update, direct factor, backward substitution) iterate rows (c, col_end[c]]
+    # instead of testing every row below c against its envelope. O(sum_span), like the envelope itself.
+    for ld in range(n):
+        island_state.dof_env_col_end[dof_base + ld, i_b] = ld
+    for ld in range(n):
+        env_i = island_state.dof_env_start_local[dof_base + ld, i_b]
+        for c in range(env_i, ld):
+            if ld > island_state.dof_env_col_end[dof_base + c, i_b]:
+                island_state.dof_env_col_end[dof_base + c, i_b] = ld
 
 
 @qd.func
@@ -1991,33 +2004,44 @@ def func_hessian_direct_batch(
                 j_dg = island_state.dof_id[dof_base + j_d, i_b]
                 constraint_state.nt_H[i_b, i_dg, j_dg] = gs.qd_float(0.0)
         # H += J.T @ D @ J by scattering each island constraint's rank update over the DOF pairs in its support
-        # (jac_dofs_idx), writing the lower triangle at global rows/cols. This is O(sum n_support^2) instead of the
+        # (jac_dofs_idx), writing the triangle oriented by ISLAND-LOCAL position: with the fill-reducing (RCM) dof_id
+        # of the CPU skyline path the local order is not globally monotonic, and every per-island factor/solve
+        # consumer reads the block through the same local orientation. This is O(sum n_support^2) instead of the
         # O(n_dofs * n_constraints) row-by-constraint scan, which matters when an island carries many contacts.
         for i_lcon in range(con_n):
             i_c = island_state.constraint_id[con_base + i_lcon, i_b]
-            jac_n = constraint_state.jac_n_dofs[i_c, i_b]
-            for i_d1_ in range(jac_n):
-                i_d1 = constraint_state.jac_dofs_idx[i_c, i_d1_, i_b]
-                if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
+            # An inactive constraint contributes nothing to H; skip its whole scatter instead of multiplying by 0.
+            if constraint_state.active[i_c, i_b]:
+                efc_D = constraint_state.efc_D[i_c, i_b]
+                jac_n = constraint_state.jac_n_dofs[i_c, i_b]
+                for i_d1_ in range(jac_n):
+                    i_d1 = constraint_state.jac_dofs_idx[i_c, i_d1_, i_b]
                     for i_d2_ in range(i_d1_, jac_n):
                         i_d2 = constraint_state.jac_dofs_idx[i_c, i_d2_, i_b]
                         row = qd.max(i_d1, i_d2)
                         col = qd.min(i_d1, i_d2)
+                        if qd.static(
+                            static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.sparse_envelope
+                        ):
+                            if (island_state.dof_local_pos[i_d1, i_b] >= island_state.dof_local_pos[i_d2, i_b]) != (
+                                i_d1 >= i_d2
+                            ):
+                                row, col = col, row
                         constraint_state.nt_H[i_b, row, col] = (
                             constraint_state.nt_H[i_b, row, col]
-                            + constraint_state.jac[i_c, i_d1, i_b]
-                            * constraint_state.jac[i_c, i_d2, i_b]
-                            * constraint_state.efc_D[i_c, i_b]
-                            * constraint_state.active[i_c, i_b]
+                            + constraint_state.jac[i_c, i_d1, i_b] * constraint_state.jac[i_c, i_d2, i_b] * efc_D
                         )
-        # H += M, restricted to the island's DOFs. Mass couples only DOFs within the same component (one island), so
-        # the block is dense over the island's gathered DOFs and never reaches another island's block. Iterating the
-        # gathered dof_id (rather than an entity's contiguous range) keeps the add inside this island even when a
-        # component's DOFs are non-contiguous (e.g. an entity whose free bodies interleave in DOF order).
+        # H += M, restricted to the island's DOFs. Mass couples only DOFs within the same kinematic-tree block, which
+        # is a contiguous global DOF range and so maps to a contiguous local range (dof_id is ascending). Bound the add
+        # by that block (dofs_mass_block_start, mapped to local via dof_local_pos) rather than the full constraint
+        # envelope: the envelope already includes mass coupling so block_start >= env_start, and entries below
+        # block_start are structurally zero mass. For an aligned free body the block is the diagonal, so only the
+        # diagonal mass is added; for articulated bodies the whole branch block is added.
         for i_d in range(n):
             i_dg = island_state.dof_id[dof_base + i_d, i_b]
-            env_i = island_state.dof_env_start_local[dof_base + i_d, i_b]
-            for j_d in range(env_i, i_d + 1):
+            mass_block_start = rigid_global_info.dofs_mass_block_start[i_dg]
+            mass_lo = island_state.dof_local_pos[mass_block_start, i_b]
+            for j_d in range(mass_lo, i_d + 1):
                 j_dg = island_state.dof_id[dof_base + j_d, i_b]
                 constraint_state.nt_H[i_b, i_dg, j_dg] = (
                     constraint_state.nt_H[i_b, i_dg, j_dg] + rigid_global_info.mass_mat[i_dg, j_dg, i_b]
@@ -2035,35 +2059,34 @@ def func_hessian_direct_batch(
     # Compute `H += J.T @ D @ J` using either dense or sparse implementation
     if qd.static(static_rigid_sim_config.sparse_solve):
         for i_c in range(constraint_state.n_constraints[i_b]):
-            jac_n_dofs = constraint_state.jac_n_dofs[i_c, i_b]
-            for i_d1_ in range(jac_n_dofs):
-                i_d1 = constraint_state.jac_dofs_idx[i_c, i_d1_, i_b]
-                if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
-                    for i_d2_ in range(i_d1_, jac_n_dofs):
-                        i_d2 = constraint_state.jac_dofs_idx[i_c, i_d2_, i_b]
-                        # Write to permuted positions (identity when reordering is off). jac/efc_D are read in natural
-                        # DOF order; only the Hessian storage position is permuted.
-                        p1 = constraint_state.dof_iperm[i_b, i_d1]
-                        p2 = constraint_state.dof_iperm[i_b, i_d2]
-                        row = qd.max(p1, p2)
-                        col = qd.min(p1, p2)
-                        constraint_state.nt_H[i_b, row, col] = (
-                            constraint_state.nt_H[i_b, row, col]
-                            + constraint_state.jac[i_c, i_d1, i_b]
-                            * constraint_state.jac[i_c, i_d2, i_b]
-                            * constraint_state.efc_D[i_c, i_b]
-                            * constraint_state.active[i_c, i_b]
-                        )
+            # An inactive constraint contributes nothing to H; skip its whole scatter instead of multiplying by 0.
+            if constraint_state.active[i_c, i_b]:
+                efc_D = constraint_state.efc_D[i_c, i_b]
+                jac_n_dofs = constraint_state.jac_n_dofs[i_c, i_b]
+                for i_d1_ in range(jac_n_dofs):
+                    i_d1 = constraint_state.jac_dofs_idx[i_c, i_d1_, i_b]
+                    if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
+                        for i_d2_ in range(i_d1_, jac_n_dofs):
+                            i_d2 = constraint_state.jac_dofs_idx[i_c, i_d2_, i_b]
+                            # Write to permuted positions (identity when reordering is off). jac/efc_D are read in
+                            # natural DOF order; only the Hessian storage position is permuted.
+                            p1 = constraint_state.dof_iperm[i_b, i_d1]
+                            p2 = constraint_state.dof_iperm[i_b, i_d2]
+                            row = qd.max(p1, p2)
+                            col = qd.min(p1, p2)
+                            constraint_state.nt_H[i_b, row, col] = (
+                                constraint_state.nt_H[i_b, row, col]
+                                + constraint_state.jac[i_c, i_d1, i_b] * constraint_state.jac[i_c, i_d2, i_b] * efc_D
+                            )
     else:
         for i_d1, i_c in qd.ndrange(n_dofs, constraint_state.n_constraints[i_b]):
-            if qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
+            if constraint_state.active[i_c, i_b] and qd.abs(constraint_state.jac[i_c, i_d1, i_b]) > EPS:
                 for i_d2 in range(i_d1 + 1):
                     constraint_state.nt_H[i_b, i_d1, i_d2] = (
                         constraint_state.nt_H[i_b, i_d1, i_d2]
                         + constraint_state.jac[i_c, i_d2, i_b]
                         * constraint_state.jac[i_c, i_d1, i_b]
                         * constraint_state.efc_D[i_c, i_b]
-                        * constraint_state.active[i_c, i_b]
                     )
 
     # Compute `H += M`. With sparse_solve the storage position is permuted via dof_iperm; otherwise it is natural
@@ -2601,7 +2624,14 @@ def func_cholesky_factor_direct_batch(
                 tmp = tmp - constraint_state.nt_H[i_b, i_dg, j_dg] ** 2
             constraint_state.nt_H[i_b, i_dg, i_dg] = qd.sqrt(qd.max(tmp, EPS))
             inv = 1.0 / constraint_state.nt_H[i_b, i_dg, i_dg]
-            for j_d in range(i_d + 1, n):
+            # Only rows whose envelope reaches column i_d can be nonzero there. The CPU per-island path always
+            # computes dof_env_col_end in its solve init, so it can bound the row sweep by the column height; other
+            # configs (GPU per-island) may factor without computing the envelope, whose 0-default would wrongly
+            # truncate, so they keep the full scan.
+            j_d_end = n
+            if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.sparse_envelope):
+                j_d_end = island_state.dof_env_col_end[dof_base + i_d, i_b] + 1
+            for j_d in range(i_d + 1, j_d_end):
                 j_start = island_state.dof_env_start_local[dof_base + j_d, i_b]
                 if j_start <= i_d:
                     j_dg = island_state.dof_id[dof_base + j_d, i_b]
@@ -3117,7 +3147,23 @@ def func_hessian_and_cholesky_factor_incremental_sparse_batch(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
 ) -> bool:
+    """Maintain the whole-env skyline factor L (in nt_H, permuted layout) by a rank-1 update/downdate per changed
+    constraint, instead of reassembling and re-factoring H from scratch.
+
+    For each constraint whose active state flipped, H changes by +-D * jac jac^T (+ when it became active, - when it
+    became inactive), so L changes by the matching rank-1 Cholesky update (sign +1) or downdate (sign -1). The update
+    processes columns in ascending permuted order from the support's smallest permuted index; its fill stays within the
+    skyline envelope (nt_H_env_start), which is the structural pattern over all constraints, so the inner loop visits
+    only rows whose band reaches column k. Returns True if a downdate hits a non-positive pivot (caller rebuilds).
+
+    nt_vec is the working rank-1 vector in permuted layout; it self-clears as each column is consumed, but a degenerate
+    break leaves residual entries, so it is zeroed up front to stay correct across calls.
+    """
     EPS = rigid_global_info.EPS[None]
+    n_dofs = constraint_state.nt_H.shape[1]
+
+    for p in range(n_dofs):
+        constraint_state.nt_vec[p, i_b] = gs.qd_float(0.0)
 
     is_degenerated = False
     for idx in range(constraint_state.incr_n_changed[i_b]):
@@ -3125,35 +3171,227 @@ def func_hessian_and_cholesky_factor_incremental_sparse_batch(
         sign = 1.0 if constraint_state.active[i_c, i_b] else -1.0
         efc_D_sqrt = qd.sqrt(constraint_state.efc_D[i_c, i_b])
 
-        for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-            i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
-            constraint_state.nt_vec[i_d, i_b] = constraint_state.jac[i_c, i_d, i_b] * efc_D_sqrt
-
+        # Scatter the constraint's row into the rank-1 vector at permuted positions; track the smallest one.
+        p_min = n_dofs
         for k_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
-            k = constraint_state.jac_dofs_idx[i_c, k_, i_b]
-            Lkk = constraint_state.nt_H[i_b, k, k]
-            tmp = Lkk**2 + sign * constraint_state.nt_vec[k, i_b] ** 2
-            if tmp < EPS:
-                is_degenerated = True
-                break
-            r = qd.sqrt(tmp)
-            c = r / Lkk
-            cinv = 1 / c
-            s = constraint_state.nt_vec[k, i_b] / Lkk
-            constraint_state.nt_H[i_b, k, k] = r
-            for i_ in range(k_):
-                i = constraint_state.jac_dofs_idx[i_c, i_, i_b]  # i is strictly > k
-                constraint_state.nt_H[i_b, i, k] = (
-                    constraint_state.nt_H[i_b, i, k] + s * constraint_state.nt_vec[i, i_b] * sign
-                ) * cinv
+            i_d = constraint_state.jac_dofs_idx[i_c, k_, i_b]
+            p = constraint_state.dof_iperm[i_b, i_d]
+            constraint_state.nt_vec[p, i_b] = constraint_state.jac[i_c, i_d, i_b] * efc_D_sqrt
+            if p < p_min:
+                p_min = p
 
-            for i_ in range(k_):
-                i = constraint_state.jac_dofs_idx[i_c, i_, i_b]  # i is strictly > k
-                constraint_state.nt_vec[i, i_b] = (
-                    constraint_state.nt_vec[i, i_b] * c - s * constraint_state.nt_H[i_b, i, k]
-                )
+        # Ascending columns from the support's first permuted index; fill stays within the skyline envelope.
+        for k in range(p_min, n_dofs):
+            vk = constraint_state.nt_vec[k, i_b]
+            if qd.abs(vk) > EPS:
+                Lkk = constraint_state.nt_H[i_b, k, k]
+                tmp = Lkk * Lkk + sign * vk * vk
+                if tmp < EPS:
+                    is_degenerated = True
+                    break
+                r = qd.sqrt(tmp)
+                cinv = Lkk / r
+                s = vk / Lkk
+                constraint_state.nt_H[i_b, k, k] = r
+                for i in range(k + 1, n_dofs):
+                    if constraint_state.nt_H_env_start[i_b, i] <= k:
+                        constraint_state.nt_H[i_b, i, k] = (
+                            constraint_state.nt_H[i_b, i, k] + sign * s * constraint_state.nt_vec[i, i_b]
+                        ) * cinv
+                        constraint_state.nt_vec[i, i_b] = (r / Lkk) * constraint_state.nt_vec[
+                            i, i_b
+                        ] - s * constraint_state.nt_H[i_b, i, k]
+                constraint_state.nt_vec[k, i_b] = gs.qd_float(0.0)
+        if is_degenerated:
+            break
 
     return is_degenerated
+
+
+@qd.func
+def func_rank_batch_update_island(
+    i_b,
+    i_island,
+    batch_ic,
+    n_u,
+    island_state: array_class.IslandState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+) -> bool:
+    """Apply batched rank-1 updates/downdates to the island's Cholesky block of L, in place in nt_H, fused into a
+    single column sweep.
+
+    A rank-1 rotation at column ld only reads state produced by earlier updates at that column and by its own
+    rotations at earlier columns, so interleaving the n_u updates per column computes bit-identical results to running
+    them sequentially, while visiting each L column once instead of n_u times (amortized index and envelope lookups,
+    and n_u independent rotation chains per column). The sweep runs over ascending island-local positions from the
+    batch's first support row, bounded per column by the skyline height (dof_env_col_end). nt_vec holds one
+    working vector per batch slot, flattened slot-minor ([i_d * hessian_rank_update_batch + i_u]); the caller zeroes
+    the island's entries once per incremental attempt. Returns whether any downdate went indefinite, in which case the caller refactors the island directly
+    (discarding the partially updated L, so the fused ordering is unobservable).
+    """
+    EPS = rigid_global_info.EPS[None]
+    dof_base = island_state.dof_slices.start[i_island, i_b]
+    n = island_state.dof_slices.n[i_island, i_b]
+
+    signs = qd.Vector.zero(gs.qd_float, static_rigid_sim_config.hessian_rank_update_batch)
+    # Rows before the batch's first support DOF hold an exact zero in every working vector, so the sweep starts there.
+    ld_start = n
+    for i_u in qd.static(range(static_rigid_sim_config.hessian_rank_update_batch)):
+        if i_u < n_u:
+            i_c = batch_ic[i_u]
+            signs[i_u] = 1.0 if constraint_state.active[i_c, i_b] else -1.0
+            efc_D_sqrt = qd.sqrt(constraint_state.efc_D[i_c, i_b])
+            for i_d_ in range(constraint_state.jac_n_dofs[i_c, i_b]):
+                i_d = constraint_state.jac_dofs_idx[i_c, i_d_, i_b]
+                slot_base = i_d * static_rigid_sim_config.hessian_rank_update_batch
+                constraint_state.nt_vec[slot_base + i_u, i_b] = constraint_state.jac[i_c, i_d, i_b] * efc_D_sqrt
+                ld_support = island_state.dof_local_pos[i_d, i_b]
+                if ld_support < ld_start:
+                    ld_start = ld_support
+
+    is_degenerated = False
+    for ld in range(ld_start, n):
+        i_dg = island_state.dof_id[dof_base + ld, i_b]
+        slot_base = i_dg * static_rigid_sim_config.hessian_rank_update_batch
+        # Diagonal phase: chain each update's rotation parameters through Lkk, in batch order (the same value each
+        # update would read had the previous ones fully completed - column-local state only).
+        cs = qd.Vector.zero(gs.qd_float, static_rigid_sim_config.hessian_rank_update_batch)
+        ss = qd.Vector.zero(gs.qd_float, static_rigid_sim_config.hessian_rank_update_batch)
+        cinvs = qd.Vector.zero(gs.qd_float, static_rigid_sim_config.hessian_rank_update_batch)
+        is_rotated = qd.Vector.zero(gs.qd_int, static_rigid_sim_config.hessian_rank_update_batch)
+        Lkk = constraint_state.nt_H[i_b, i_dg, i_dg]
+        for i_u in qd.static(range(static_rigid_sim_config.hessian_rank_update_batch)):
+            if i_u < n_u and not is_degenerated:
+                vk = constraint_state.nt_vec[slot_base + i_u, i_b]
+                if qd.abs(vk) > EPS:
+                    tmp = Lkk * Lkk + signs[i_u] * vk * vk
+                    if tmp < EPS:
+                        is_degenerated = True
+                    else:
+                        r = qd.sqrt(tmp)
+                        cinvs[i_u] = Lkk / r
+                        cs[i_u] = r / Lkk
+                        ss[i_u] = vk / Lkk
+                        is_rotated[i_u] = 1
+                        Lkk = r
+        if is_degenerated:
+            break
+        constraint_state.nt_H[i_b, i_dg, i_dg] = Lkk
+        # Row phase: apply the n_u rotations to each coupled row, chaining L through the batch. Only rows whose
+        # envelope reaches column ld can couple; col_end bounds them so a banded island sweeps its bandwidth
+        # instead of every row below ld.
+        for jd in range(ld + 1, island_state.dof_env_col_end[dof_base + ld, i_b] + 1):
+            if island_state.dof_env_start_local[dof_base + jd, i_b] <= ld:
+                j_dg = island_state.dof_id[dof_base + jd, i_b]
+                j_slot_base = j_dg * static_rigid_sim_config.hessian_rank_update_batch
+                Lj = constraint_state.nt_H[i_b, j_dg, i_dg]
+                for i_u in qd.static(range(static_rigid_sim_config.hessian_rank_update_batch)):
+                    if is_rotated[i_u] == 1:
+                        vj = constraint_state.nt_vec[j_slot_base + i_u, i_b]
+                        Lj = (Lj + signs[i_u] * ss[i_u] * vj) * cinvs[i_u]
+                        constraint_state.nt_vec[j_slot_base + i_u, i_b] = cs[i_u] * vj - ss[i_u] * Lj
+                constraint_state.nt_H[i_b, j_dg, i_dg] = Lj
+        for i_u in qd.static(range(static_rigid_sim_config.hessian_rank_update_batch)):
+            if is_rotated[i_u] == 1:
+                constraint_state.nt_vec[slot_base + i_u, i_b] = gs.qd_float(0.0)
+    return is_degenerated
+
+
+@qd.func
+def func_factor_island_incremental_or_direct(
+    i_b,
+    i_island,
+    island_state: array_class.IslandState,
+    entities_info: array_class.EntitiesInfo,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Maintain one island's Cholesky factor for the current active set, choosing per island between an incremental
+    rank-1 update/downdate and a direct refactor.
+
+    One rank-1 update sweeps the island's skyline envelope at O(sum_span) (sum_span = total row span = envelope
+    nonzeros), so n_changed of them cost O(n_changed * sum_span); a direct refactor factors it at O(sum_span_sq)
+    (sum_span_sq = sum of squared row spans). Both costs are read straight off the envelope, so the decision compares
+    them directly - incremental while n_changed * sum_span < sum_span_sq - with no scene-tuned constant. The choice must
+    be per island, not on the env-wide flip count: the rebuild path refactors every island, so a global decision would
+    needlessly refactor quiescent islands whenever flips are spread thin across many of them (e.g. several separated
+    piles each toggling a single contact).
+    """
+    c_start = island_state.constraint_slices.start[i_island, i_b]
+    c_n = island_state.constraint_slices.n[i_island, i_b]
+
+    n_changed = 0
+    for k in range(c_n):
+        i_c = island_state.constraint_id[c_start + k, i_b]
+        if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
+            n_changed = n_changed + 1
+
+    if n_changed > 0:
+        dof_base = island_state.dof_slices.start[i_island, i_b]
+        n_isl_dofs = island_state.dof_slices.n[i_island, i_b]
+        # Estimate both costs from the skyline envelope, per envelope entry: a fused pass over the envelope pays the
+        # index/envelope work once (n_passes * sum_span) plus one rotation per update (n_changed * sum_span), while a
+        # direct refactor pays index work and one FMA on each of the sum_span_sq entries. Incremental wins while
+        # (n_changed + n_passes) * sum_span < 2 * sum_span_sq. No scene-tuned constant.
+        sum_span = gs.qd_float(0.0)
+        sum_span_sq = gs.qd_float(0.0)
+        for ld in range(n_isl_dofs):
+            row_span = gs.qd_float(ld - island_state.dof_env_start_local[dof_base + ld, i_b])
+            sum_span = sum_span + row_span
+            sum_span_sq = sum_span_sq + row_span * row_span
+        n_passes = (
+            n_changed + static_rigid_sim_config.hessian_rank_update_batch - 1
+        ) // static_rigid_sim_config.hessian_rank_update_batch
+        need_rebuild = gs.qd_float(n_changed + n_passes) * sum_span > 2.0 * sum_span_sq
+        if not need_rebuild:
+            for ld in range(n_isl_dofs):
+                slot_base = island_state.dof_id[dof_base + ld, i_b] * static_rigid_sim_config.hessian_rank_update_batch
+                for i_u in qd.static(range(static_rigid_sim_config.hessian_rank_update_batch)):
+                    constraint_state.nt_vec[slot_base + i_u, i_b] = gs.qd_float(0.0)
+            # Gather the flipped constraints into fixed-size batches; apply each batch as one fused column sweep.
+            batch_ic = qd.Vector.zero(gs.qd_int, static_rigid_sim_config.hessian_rank_update_batch)
+            n_u = 0
+            for k in range(c_n):
+                i_c = island_state.constraint_id[c_start + k, i_b]
+                if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
+                    batch_ic[n_u] = i_c
+                    n_u = n_u + 1
+                    if n_u == static_rigid_sim_config.hessian_rank_update_batch:
+                        if func_rank_batch_update_island(
+                            i_b,
+                            i_island,
+                            batch_ic,
+                            n_u,
+                            island_state,
+                            constraint_state,
+                            rigid_global_info,
+                            static_rigid_sim_config,
+                        ):
+                            need_rebuild = True
+                            break
+                        n_u = 0
+            if not need_rebuild and n_u > 0:
+                if func_rank_batch_update_island(
+                    i_b,
+                    i_island,
+                    batch_ic,
+                    n_u,
+                    island_state,
+                    constraint_state,
+                    rigid_global_info,
+                    static_rigid_sim_config,
+                ):
+                    need_rebuild = True
+        if need_rebuild:
+            func_hessian_direct_batch(
+                i_b, i_island, island_state, entities_info, constraint_state, rigid_global_info, static_rigid_sim_config
+            )
+            func_cholesky_factor_direct_batch(
+                i_b, i_island, island_state, constraint_state, rigid_global_info, static_rigid_sim_config
+            )
 
 
 @qd.func
@@ -3230,7 +3468,12 @@ def func_cholesky_solve_batch(
             ld = n - 1 - ld_
             gd = island_state.dof_id[dof_base + ld, i_b]
             curr_out = constraint_state.Mgrad[gd, i_b]
-            for j_d in range(ld + 1, n):
+            # Bound the column sweep by the column height where the envelope is guaranteed computed (CPU per-island
+            # path); see the matching bound in func_cholesky_factor_direct_batch.
+            j_d_end = n
+            if qd.static(static_rigid_sim_config.sparse_solve and not static_rigid_sim_config.sparse_envelope):
+                j_d_end = island_state.dof_env_col_end[dof_base + ld, i_b] + 1
+            for j_d in range(ld + 1, j_d_end):
                 if island_state.dof_env_start_local[dof_base + j_d, i_b] <= ld:
                     g_jd = island_state.dof_id[dof_base + j_d, i_b]
                     curr_out = curr_out - constraint_state.nt_H[i_b, g_jd, gd] * constraint_state.Mgrad[g_jd, i_b]
@@ -5005,6 +5248,7 @@ def func_solve_init(
 @qd.func
 def func_solve_iter(
     i_b,
+    it,
     entities_info: array_class.EntitiesInfo,
     dofs_state: array_class.DofsState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -5050,19 +5294,61 @@ def func_solve_iter(
         )
 
         if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
-            # Islands (if any) are handled inside the per-env factor funcs. The sparse path always rebuilds the
-            # Hessian directly (the incremental rank-1 update assumes globally descending DOF order in jac_dofs_idx,
-            # which does not hold for cross-entity constraints); the dense path uses the incremental update, falling
-            # back to a direct rebuild when it degenerates.
-            if qd.static(static_rigid_sim_config.sparse_solve):
-                func_hessian_and_cholesky_factor_direct_batch(
-                    i_b,
-                    island_state=island_state,
-                    entities_info=entities_info,
-                    constraint_state=constraint_state,
-                    rigid_global_info=rigid_global_info,
-                    static_rigid_sim_config=static_rigid_sim_config,
-                )
+            # Within a step jac, M and efc_D are fixed, so H = M + J.T diag(D active) J depends only on the active mask;
+            # the linesearch only moves qacc, never H. func_solve_init already seeded the factor (nt_H holds L for the
+            # seed's active set, and update_constraint above set prev_active to it), so every iteration is maintained
+            # rather than rebuilt: if no constraint flipped active the factor is reused as-is; if a few flipped, the
+            # skyline factor is updated by a rank-1 update/downdate per changed constraint; a degenerate downdate or a
+            # large active-set change falls back to a direct refactor. The per-island path decides this per island (the
+            # refactor is per island, so a global decision would needlessly rebuild quiescent islands); the whole-env
+            # sparse path and the dense path decide on the env-wide flip count.
+            if qd.static(
+                static_rigid_sim_config.sparse_solve
+                and static_rigid_sim_config.enable_per_island_solve
+                and not static_rigid_sim_config.sparse_envelope
+            ):
+                for i_island in range(island_state.n_islands[i_b]):
+                    if qd.static(static_rigid_sim_config.use_hibernation):
+                        if island_state.is_hibernated[i_island, i_b]:
+                            continue
+                    func_factor_island_incremental_or_direct(
+                        i_b,
+                        i_island,
+                        island_state,
+                        entities_info,
+                        constraint_state,
+                        rigid_global_info,
+                        static_rigid_sim_config,
+                    )
+            elif qd.static(static_rigid_sim_config.sparse_solve):
+                func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+                n_changed = constraint_state.incr_n_changed[i_b]
+                need_rebuild = True
+                if n_changed == 0:
+                    need_rebuild = False
+                elif qd.static(static_rigid_sim_config.sparse_envelope):
+                    # Same crossover as the per-island path, on the whole-env skyline (nt_H_env_start): incremental
+                    # beats a refactor while n_changed * sum_span < sum_span_sq (the flop-weighted effective bandwidth).
+                    n_dofs = constraint_state.nt_H.shape[1]
+                    sum_span = gs.qd_float(0.0)
+                    sum_span_sq = gs.qd_float(0.0)
+                    for p in range(n_dofs):
+                        row_span = gs.qd_float(p - constraint_state.nt_H_env_start[i_b, p])
+                        sum_span = sum_span + row_span
+                        sum_span_sq = sum_span_sq + row_span * row_span
+                    if gs.qd_float(n_changed) * sum_span <= sum_span_sq:
+                        need_rebuild = func_hessian_and_cholesky_factor_incremental_sparse_batch(
+                            i_b, constraint_state, rigid_global_info
+                        )
+                if need_rebuild:
+                    func_hessian_and_cholesky_factor_direct_batch(
+                        i_b,
+                        island_state=island_state,
+                        entities_info=entities_info,
+                        constraint_state=constraint_state,
+                        rigid_global_info=rigid_global_info,
+                        static_rigid_sim_config=static_rigid_sim_config,
+                    )
             else:
                 is_degenerated = func_hessian_and_cholesky_factor_incremental_batch(
                     i_b,
@@ -5178,9 +5464,10 @@ def _kernel_solve_monolith(
                 )
                 for i_d in range(n_dofs):
                     constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
-            for _ in range(rigid_global_info.iterations[None]):
+            for it in range(rigid_global_info.iterations[None]):
                 func_solve_iter(
                     i_b,
+                    it,
                     entities_info=entities_info,
                     dofs_state=dofs_state,
                     rigid_global_info=rigid_global_info,
