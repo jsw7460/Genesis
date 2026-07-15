@@ -54,8 +54,6 @@ from . import narrowphase
 from .narrowphase import (
     CCD_ALGORITHM_CODE,
     func_contact_sphere_sdf,
-    func_contact_vertex_sdf,
-    func_contact_edge_sdf,
     func_contact_convex_convex_sdf,
     func_contact_mpr_terrain,
     func_add_prism_vert,
@@ -102,7 +100,6 @@ class Collider:
         self._prune_deep_penetration_ratio = 3.0
         self._prune_max_contacts_per_link_pair = 32
         self._prune_max_contacts_floor = 512
-        self._noslip_max_contacts = 128
 
         self._init_static_config()
         self._use_split_narrowphase = (
@@ -128,20 +125,31 @@ class Collider:
             self._init_multicontact_gjk_state()
 
         if gs.use_zerocopy:
-            self._contact_data: dict[str, torch.Tensor] = {}
-            for key, name in (
-                ("link_a", "link_a"),
-                ("link_b", "link_b"),
-                ("geom_a", "geom_a"),
-                ("geom_b", "geom_b"),
-                ("penetration", "penetration"),
-                ("position", "pos"),
-                ("normal", "normal"),
-                ("force", "force"),
-            ):
-                self._contact_data[key] = qd_to_torch(
-                    getattr(self._collider_state.contact_data, name), transpose=True, copy=False
-                )
+            # Probe every view the zero-copy contact query needs (including the per-call n_contacts and
+            # contact_sort_idx ones, which qd_to_torch caches on their fields). If any field sits past 2**31 bytes
+            # in its SNode tree no zero-copy view exists, and get_contacts falls back to the gather-kernel path.
+            self._contact_data: dict[str, torch.Tensor] | None = {}
+            try:
+                qd_to_torch(self._collider_state.n_contacts, copy=False)
+                qd_to_torch(self._collider_state.contact_sort_idx, transpose=True, copy=False)
+                qd_to_torch(self._collider_state.first_time, copy=False)
+                qd_to_torch(self._collider_state.contact_cache.normal, copy=False)
+                qd_to_torch(self._collider_state.contact_cache.penetration, copy=False)
+                for key, name in (
+                    ("link_a", "link_a"),
+                    ("link_b", "link_b"),
+                    ("geom_a", "geom_a"),
+                    ("geom_b", "geom_b"),
+                    ("penetration", "penetration"),
+                    ("position", "pos"),
+                    ("normal", "normal"),
+                    ("force", "force"),
+                ):
+                    self._contact_data[key] = qd_to_torch(
+                        getattr(self._collider_state.contact_data, name), transpose=True, copy=False
+                    )
+            except ValueError:
+                self._contact_data = None
 
         # Make sure that the initial state is clean
         self.clear()
@@ -263,6 +271,7 @@ class Collider:
         self._init_collision_pair_idx(self._collision_pair_idx)
         self._init_valid_pairs()
         self._init_verts_connectivity(vert_neighbors, vert_neighbor_start, vert_n_neighbors)
+        self._init_verts_spatial_grid()
         self._init_max_contacts(self._n_possible_pairs, self._large_contact_pair_mask)
         self._init_terrain_state()
 
@@ -607,6 +616,54 @@ class Collider:
 
         return vert_neighbors, vert_neighbor_start, vert_n_neighbors
 
+    def _init_verts_spatial_grid(self):
+        """
+        Sort each geom's collision verts into a fixed 8x8x8 grid over its local AABB, as a permutation of vert
+        indices ordered by grid cell (z fastest) plus per-cell vert ranges.
+
+        The nonconvex narrowphase visits only the cells overlapping the other geom's pulled-back AABB, skipping far
+        verts wholesale. Binning uses the same single-precision cell mapping as the kernel side; that mapping is
+        monotone, so a vert inside a (padded) query box always lands inside the visited cell range.
+        """
+        if self._solver.n_verts == 0:
+            return
+        n_geoms = len(self._solver.geoms)
+        verts_idx = []
+        verts_pos = []
+        cells_vert_start = []
+        geoms_origin = np.zeros((n_geoms, 3), dtype=gs.np_float)
+        geoms_inv_cell_size = np.zeros((n_geoms, 3), dtype=gs.np_float)
+        offset_vert = 0
+        for i_g, geom in enumerate(self._solver.geoms):
+            verts = geom.init_verts.astype(gs.np_float)
+            if len(verts) == 0:
+                verts_idx.append(np.zeros(0, dtype=gs.np_int))
+                verts_pos.append(np.zeros((0, 3), dtype=gs.np_float))
+                cells_vert_start.append(np.full(8**3 + 1, offset_vert, dtype=gs.np_int))
+                continue
+            origin = verts.min(axis=0)
+            extent = verts.max(axis=0) - origin
+            inv_cell_size = np.where(extent > 0.0, 8 / np.maximum(extent, gs.EPS), 0.0).astype(gs.np_float)
+            verts_cell = np.clip(np.floor((verts - origin) * inv_cell_size), 0, 7).astype(gs.np_int)
+            verts_cell_flat = (verts_cell[:, 0] * 8 + verts_cell[:, 1]) * 8 + verts_cell[:, 2]
+            order = np.argsort(verts_cell_flat, kind="stable")
+            verts_idx.append(order + geom.vert_start)
+            # The positions themselves are duplicated in spatial order: the scan streams them sequentially, where
+            # gathering through the permutation would defeat the prefetcher on the hot path.
+            verts_pos.append(verts[order])
+            counts = np.bincount(verts_cell_flat, minlength=8**3)
+            cells_vert_start.append(np.concatenate(([0], counts.cumsum())) + offset_vert)
+            geoms_origin[i_g] = origin
+            geoms_inv_cell_size[i_g] = inv_cell_size
+            offset_vert = offset_vert + len(verts)
+
+        verts_spatial_grid = self._collider_info.verts_spatial_grid
+        verts_spatial_grid.verts_idx.from_numpy(np.concatenate(verts_idx, dtype=gs.np_int))
+        verts_spatial_grid.verts_pos.from_numpy(np.concatenate(verts_pos, dtype=gs.np_float))
+        verts_spatial_grid.cells_vert_start.from_numpy(np.concatenate(cells_vert_start, dtype=gs.np_int))
+        verts_spatial_grid.geoms_origin.from_numpy(geoms_origin)
+        verts_spatial_grid.geoms_inv_cell_size.from_numpy(geoms_inv_cell_size)
+
     def _init_collision_pair_idx(self, collision_pair_idx):
         if self._n_possible_pairs == 0:
             self._collider_info.collision_pair_idx.fill(-1)
@@ -628,7 +685,9 @@ class Collider:
         max_collision_pairs = min(self._solver.max_collision_pairs, n_possible_pairs)
         # Size the contact buffer per regime: nonconvex pairs each emit up to n_contacts_per_nonconvex_pair, convex and
         # terrain pairs up to n_contacts_per_convex_pair. The worst case fills the capped pair budget with as many
-        # (larger-cap) nonconvex pairs as exist, then the rest with convex pairs.
+        # (larger-cap) nonconvex pairs as exist, then the rest with convex pairs. The budget of a nonconvex pair is
+        # shared between its two vertex scans: the verification scan appends while the pair is under its cap and then
+        # only displaces the pair's least-penetrating contact, so the cap holds regardless of the number of scans.
         cap_nonconvex = self._collider_static_config.n_contacts_per_nonconvex_pair
         cap_convex = self._collider_static_config.n_contacts_per_convex_pair
         n_nonconvex = min(n_possible_nonconvex_pairs, max_collision_pairs)
@@ -661,13 +720,6 @@ class Collider:
             max_contacts_pruned = np.minimum(link_pairs_n_contacts, self._prune_max_contacts_per_link_pair)
             max_contacts_pruned_total = max(int(max_contacts_pruned.sum()), self._prune_max_contacts_floor)
             max_contacts = min(max_contacts, max_contacts_pruned_total)
-
-        # The noslip dual matrix efc_AR is quadratic in the contact budget, so noslip scenes get a much tighter
-        # default cap: measured noslip workloads (manipulation-style scenes) peak below ~70 simultaneous contact
-        # points, while the worst-case candidate budget is orders of magnitude larger. A denser scene hits the
-        # max_contacts clamp and halts with a request to set 'max_contacts' explicitly, which overrides this cap.
-        if self._solver._options.noslip_iterations > 0 and self._solver._options.max_contacts is None:
-            max_contacts = min(max_contacts, self._noslip_max_contacts)
 
         self._collider_info.max_possible_pairs[None] = n_possible_pairs
         self._collider_info.max_collision_pairs[None] = max_collision_pairs
@@ -703,7 +755,7 @@ class Collider:
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
         self._contact_data_cache.clear()
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and self._contact_data is not None:
             envs_idx = slice(None) if envs_idx is None else envs_idx
             if not cache_only:
                 first_time = qd_to_torch(self._collider_state.first_time, copy=False)
@@ -740,6 +792,7 @@ class Collider:
 
         if (
             gs.use_zerocopy
+            and self._contact_data is not None
             and not self._solver._use_hibernation
             and (not isinstance(envs_idx, torch.Tensor) or (not IS_OLD_TORCH or envs_idx.dtype == torch.bool))
         ):
@@ -883,7 +936,6 @@ class Collider:
                 self._solver.geoms_init_AABB,
                 self._solver.verts_info,
                 self._solver.faces_info,
-                self._solver.edges_info,
                 self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
                 self._collider_state,
@@ -937,7 +989,6 @@ class Collider:
                 self._solver.geoms_info,
                 self._solver.geoms_init_AABB,
                 self._solver.verts_info,
-                self._solver.edges_info,
                 self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
                 self._collider_state,
@@ -991,7 +1042,7 @@ class Collider:
             not self._collider_static_config.has_prunable_contacts
             and not self._collider_static_config.spatial_sort_supported
         )
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and self._contact_data is not None:
             n_contacts = qd_to_torch(self._collider_state.n_contacts, copy=False)
             if as_tensor or n_envs == 0:
                 n_contacts_max = (n_contacts if n_envs == 0 else n_contacts.max()).item()

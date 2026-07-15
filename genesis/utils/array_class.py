@@ -130,6 +130,7 @@ class RigidGlobalInfo:
     ls_tolerance: qd.Tensor
     noslip_iterations: qd.Tensor
     noslip_tolerance: qd.Tensor
+    impratio: qd.Tensor
     n_equalities: qd.Tensor
     n_candidate_equalities: qd.Tensor
     hibernation_thresh_vel: qd.Tensor
@@ -206,6 +207,7 @@ def get_rigid_global_info(solver, kinematic_only):
             ls_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             noslip_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
             noslip_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
+            impratio=V_SCALAR_FROM(dtype=gs.qd_float, value=1.0),
             n_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
             n_candidate_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
             hibernation_thresh_vel=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
@@ -243,6 +245,7 @@ def get_rigid_global_info(solver, kinematic_only):
         ls_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.ls_tolerance),
         noslip_iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._options.noslip_iterations),
         noslip_tolerance=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.noslip_tolerance),
+        impratio=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._options.impratio),
         n_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._n_equalities),
         n_candidate_equalities=V_SCALAR_FROM(dtype=gs.qd_int, value=solver.n_candidate_equalities_),
         hibernation_thresh_vel=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._hibernation_thresh_vel),
@@ -265,19 +268,24 @@ class ConstraintState:
     jac_n_dofs: qd.Tensor
     n_constraints_equality: qd.Tensor
     n_constraints_frictionloss: qd.Tensor
+    # Number of elliptic-cone contact rows (3 per contact), laid out contiguously at the start of the collision
+    # segment. Zero for the pyramidal cone. The cone rows occupy [ne + n_frictionloss, ne + n_frictionloss + n_cone).
+    n_constraints_cone: qd.Tensor
     improved: qd.Tensor
     Jaref: qd.Tensor
     Ma: qd.Tensor
     Ma_ws: qd.Tensor
     grad: qd.Tensor
     Mgrad: qd.Tensor
-    MinvJT: qd.Tensor
     search: qd.Tensor
+    # Previous-iteration cone-row residuals, kept only for the elliptic cone so the incremental factor can downdate the
+    # prior coupled cone block (Jaref is overwritten by the linesearch apply). Empty for the pyramidal cone.
+    cone_prev_jaref: qd.Tensor
     efc_D: qd.Tensor
+    # Frictionloss rows store their friction loss; elliptic-cone head (normal) rows reuse the field to carry the
+    # contact friction coefficient read by the cone solver (their tangent rows hold 0).
     efc_frictionloss: qd.Tensor
     efc_force: qd.Tensor
-    efc_b: qd.Tensor
-    efc_AR: qd.Tensor
     active: qd.Tensor
     prev_active: qd.Tensor
     qfrc_constraint: qd.Tensor
@@ -307,10 +315,18 @@ class ConstraintState:
     # Optional Newton fields
     # Hessian matrix of the optimization problem as a dense 2D tensor.
     # Note that only the lower triangular part is updated for efficiency because this matrix is symmetric by definition.
-    # As a result, the values of the strictly upper triangular part is undefined.
+    # As a result, the values of the strictly upper triangular part is undefined - except under
+    # enable_cone_free_hessian_reuse, where each used lower-triangle slot's mirror persists the cone-free assembled
+    # Hessian (M + J^T D J of the active rows only), maintained across a step's Newton iterations by signed flip
+    # scatters; its diagonal lives in nt_H_cone_free_diag since the lower diagonal belongs to the factor. A rebuild
+    # restores the mirror into the lower triangle and bakes the current cone blocks on top, skipping the full
+    # J^T D J reassembly.
     # In practice, this variable is re-purposed to store the Cholesky factor L st H = L @ L.T to spare memory resources.
     # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: qd.Tensor
+    # Diagonal of the persisted cone-free Hessian packed in nt_H's mirror slots (see nt_H). Only meaningful with
+    # enable_cone_free_hessian_reuse.
+    nt_H_cone_free_diag: qd.Tensor
     # Skyline envelope: nt_H_env_start[i_b, i_d] is the first (smallest) column index with a structural
     # nonzero in row i_d of the Hessian. Cholesky fill-in stays within this envelope, so the factor and
     # solve loops only need to visit columns [nt_H_env_start[i_d], i_d]. Only meaningful with sparse_solve.
@@ -374,6 +390,11 @@ def get_constraint_state(constraint_solver, solver):
     # The remaining (len_constraints_,) tensors outside the GPU cooperative flip set follow only the serialized flip.
     con_layout = (1, 0) if batch_first else None
     serial_layout = (1, 0) if serialized else None
+    # The CPU incremental factor maintains the elliptic cone by a per-iteration rank-3 update reading the previous cone
+    # residuals, so the residual cache is allocated for the CPU elliptic case.
+    is_cone_incremental = (
+        solver._static_rigid_sim_config.enable_elliptic_friction and solver._static_rigid_sim_config.backend == gs.cpu
+    )
     # The 3D Jacobian and its sparse-column-index sibling extend the flip: canonical (len_constraints_, n_dofs_, _B) ->
     # physical (_B, n_dofs_, len_constraints_) via layout=(2, 1, 0). This makes cooperative-warp-per-env access (lanes
     # stride i_c) coalesced for the hot p0 J@search, hessian_direct_tiled, and patch_hessian_delta kernels.
@@ -398,14 +419,6 @@ def get_constraint_state(constraint_solver, solver):
     )
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
-    # The decomposed (parallel) noslip build computes MinvJT and efc_AR/efc_b for all envs before the force-update
-    # sweep. The serialized path instead fuses build, sweep, and finish per env (kernel_noslip_fused): each env consumes
-    # its AR block right after writing it, so a single batch slot shared by all envs suffices. This keeps the scratch
-    # cache-hot across the fused phases and shrinks its memory footprint by n_envs, and MinvJT is never needed.
-    noslip = solver._options.noslip_iterations > 0
-    noslip_decomposed = noslip and solver._static_rigid_sim_config.para_level >= gs.PARA_LEVEL.PARTIAL
-    efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B if noslip_decomposed else 1), noslip)
-    efc_b_shape = maybe_shape((len_constraints_, _B if noslip_decomposed else 1), noslip)
     # The sparse-Jacobian representation is always active, so its index buffers are always allocated. The skyline DOF
     # permutation/envelope buffers stay gated on sparse_solve (CPU-only skyline Cholesky).
     jac_dofs_idx_shape = jac_shape
@@ -416,12 +429,6 @@ def get_constraint_state(constraint_solver, solver):
         gs.raise_exception(
             f"Jacobian shape (n_constraints={len_constraints_}, n_dofs={solver.n_dofs_}, n_envs={_B}) is too large."
         )
-    if math.prod(efc_AR_shape) > np.iinfo(np.int32).max:
-        gs.raise_exception(
-            f"efc_AR shape (n_constraints={len_constraints_}, n_constraints={len_constraints_}, "
-            f"n_envs={efc_AR_shape[2]}) is too large. Consider setting a smaller 'max_contacts' in RigidOptions "
-            "to reduce the size of reserved memory."
-        )
 
     # /!\ Changing allocation order of these tensors may reduce runtime speed by >10%  /!\
     return ConstraintState(
@@ -429,6 +436,7 @@ def get_constraint_state(constraint_solver, solver):
         qd_n_equalities=V(dtype=gs.qd_int, shape=(_B,)),
         n_constraints_equality=V(dtype=gs.qd_int, shape=(_B,)),
         n_constraints_frictionloss=V(dtype=gs.qd_int, shape=(_B,)),
+        n_constraints_cone=V(dtype=gs.qd_int, shape=(_B,)),
         is_warmstart=V(dtype=gs.qd_bool, shape=(_B,)),
         improved=V(dtype=gs.qd_bool, shape=(_B,)),
         cost_ws=V(dtype=gs.qd_float, shape=(_B,)),
@@ -450,7 +458,11 @@ def get_constraint_state(constraint_solver, solver):
         Ma_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
-        MinvJT=V(dtype=gs.qd_float, shape=maybe_shape(jac_shape, noslip_decomposed)),
+        cone_prev_jaref=V(
+            dtype=gs.qd_float,
+            shape=maybe_shape((constraint_solver.n_cone_constraints_, _B), is_cone_incremental),
+            layout=serial_layout if is_cone_incremental else None,
+        ),
         search=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         qfrc_constraint=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         qacc=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
@@ -474,8 +486,6 @@ def get_constraint_state(constraint_solver, solver):
         dof_sort_key=V(dtype=gs.qd_float, shape=sparse_dof_shape),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B), layout=serial_layout),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
-        efc_b=V(dtype=gs.qd_float, shape=efc_b_shape),
-        efc_AR=V(dtype=gs.qd_float, shape=efc_AR_shape),
         # Layout-flippable constraint-state tensors: allocated as qd.Tensor wrappers, optionally with
         # ``layout=(1, 0)`` to physically store as (_B, len_constraints_). Canonical shape stays (len_constraints_, _B);
         # kernel-body indexing ``Jaref[i_c, i_b]`` is rewritten by the AST when ``layout != None``.
@@ -515,6 +525,10 @@ def get_constraint_state(constraint_solver, solver):
         solver_iter_counter=V(dtype=qd.i32, shape=()),
         graph_counter=qd.ndarray(qd.i32, shape=()),
         early_exit_flag=V(dtype=qd.i32, shape=()),
+        nt_H_cone_free_diag=V(
+            dtype=gs.qd_float,
+            shape=maybe_shape((_B, solver.n_dofs_), solver._static_rigid_sim_config.enable_cone_free_hessian_reuse),
+        ),
     )
 
 
@@ -908,10 +922,34 @@ def get_collider_state(
 
 
 @dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class VertsSpatialGrid:
+    # Per-geom 8x8x8 grid over collision verts in the local AABB: a permutation of vert indices sorted by grid
+    # cell (z fastest), the matching vert positions duplicated in that order for sequential streaming, and per-cell
+    # vert ranges (8^3 + 1 entries per geom), so a scan visits only the cells overlapping a query box. The cell
+    # mapping is anchored by geoms_origin / geoms_inv_cell_size in the geom frame.
+    verts_idx: qd.Tensor
+    verts_pos: qd.Tensor
+    cells_vert_start: qd.Tensor
+    geoms_origin: qd.Tensor
+    geoms_inv_cell_size: qd.Tensor
+
+
+def get_verts_spatial_grid(solver):
+    return VertsSpatialGrid(
+        verts_idx=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        verts_pos=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_verts_,)),
+        cells_vert_start=V(dtype=gs.qd_int, shape=(max(solver.n_geoms * (8**3 + 1), 1),)),
+        geoms_origin=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_geoms_,)),
+        geoms_inv_cell_size=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_geoms_,)),
+    )
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
 class ColliderInfo:
     vert_neighbors: qd.Tensor
     vert_neighbor_start: qd.Tensor
     vert_n_neighbors: qd.Tensor
+    verts_spatial_grid: VertsSpatialGrid
     # (i_ga, i_gb) -> dense pair index, or -1 if invalid. Used by SAP broadphase, narrowphase, and contact cache.
     collision_pair_idx: qd.Tensor
     max_possible_pairs: qd.Tensor
@@ -956,6 +994,7 @@ def get_collider_info(solver, n_vert_neighbors, n_valid_pairs, collider_static_c
         vert_neighbors=V(dtype=gs.qd_int, shape=(max(n_vert_neighbors, 1),)),
         vert_neighbor_start=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
         vert_n_neighbors=V(dtype=gs.qd_int, shape=(solver.n_verts_,)),
+        verts_spatial_grid=get_verts_spatial_grid(solver),
         collision_pair_idx=V(dtype=gs.qd_int, shape=(solver.n_geoms_, solver.n_geoms_)),
         max_possible_pairs=V(dtype=gs.qd_int, shape=()),
         max_collision_pairs=V(dtype=gs.qd_int, shape=()),
@@ -1514,6 +1553,9 @@ class SDFGeomInfo:
     sdf_max: qd.Tensor
     sdf_cell_size: qd.Tensor
     sdf_cell_start: qd.Tensor
+    # Coarse min-grid companion: per-block minima over grid nodes, a certified lower bound of the trilinear sd.
+    sdf_coarse_res: qd.Tensor
+    sdf_coarse_cell_start: qd.Tensor
 
 
 def get_sdf_geom_info(n_geoms):
@@ -1523,6 +1565,8 @@ def get_sdf_geom_info(n_geoms):
         sdf_max=V(dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_cell_size=V_VEC(3, dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_cell_start=V(dtype=gs.qd_int, shape=(n_geoms,)),
+        sdf_coarse_res=V_VEC(3, dtype=gs.qd_int, shape=(n_geoms,)),
+        sdf_coarse_cell_start=V(dtype=gs.qd_int, shape=(n_geoms,)),
     )
 
 
@@ -1533,9 +1577,10 @@ class SDFInfo:
     geoms_sdf_val: qd.Tensor
     geoms_sdf_grad: qd.Tensor
     geoms_sdf_closest_vert: qd.Tensor
+    geoms_sdf_coarse_val: qd.Tensor
 
 
-def get_sdf_info(n_geoms, n_cells):
+def get_sdf_info(n_geoms, n_cells, n_coarse_cells):
     if math.prod((n_cells, 3)) > np.iinfo(np.int32).max:
         gs.raise_exception(
             f"SDF Gradient shape (n_cells={n_cells}, 3) is too large. Consider manually setting larger "
@@ -1548,6 +1593,7 @@ def get_sdf_info(n_geoms, n_cells):
         geoms_sdf_val=V(dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_grad=V_VEC(3, dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_closest_vert=V(dtype=gs.qd_int, shape=(max(n_cells, 1),)),
+        geoms_sdf_coarse_val=V(dtype=gs.qd_float, shape=(max(n_coarse_cells, 1),)),
     )
 
 
@@ -1900,6 +1946,7 @@ class GeomsInfo:
     conaffinity: qd.Tensor
     is_fixed: qd.Tensor
     is_decomposed: qd.Tensor
+    is_hollow: qd.Tensor
     needs_coup: qd.Tensor
     coup_friction: qd.Tensor
     coup_softness: qd.Tensor
@@ -1934,6 +1981,7 @@ def get_geoms_info(solver):
         conaffinity=V(dtype=gs.qd_int, shape=shape),
         is_fixed=V(dtype=gs.qd_bool, shape=shape),
         is_decomposed=V(dtype=gs.qd_bool, shape=shape),
+        is_hollow=V(dtype=gs.qd_bool, shape=shape),
         needs_coup=V(dtype=gs.qd_int, shape=shape),
         coup_friction=V(dtype=gs.qd_float, shape=shape),
         coup_softness=V(dtype=gs.qd_float, shape=shape),
@@ -2277,6 +2325,7 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     batch_dofs_info: bool
     batch_joints_info: bool
     enable_mujoco_compatibility: bool
+    enable_elliptic_friction: bool
     enable_multi_contact: bool
     enable_joint_limit: bool
     box_box_detection: bool
@@ -2290,6 +2339,9 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     requires_grad: bool
     prefer_decomposed_solver: int = -1  # -1 = None (auto), 0 = False, 1 = True
     use_contact_island: bool = False  # per-island Newton solve (gated; the legacy island solver is retired)
+    # Whether the cone-free assembled Hessian is persisted in nt_H's mirror slots (diagonal in nt_H_cone_free_diag);
+    # see the nt_H declaration for the packed-storage mechanics and the rigid solver's resolution for the gating.
+    enable_cone_free_hessian_reuse: bool = False
     # Consecutive sub-tolerance steps a body's max DOF velocity must hold before it is ready to hibernate. Guards
     # against a body that is only momentarily slow (e.g. at the apex of a toss) sleeping prematurely.
     hibernation_min_steps: int = 10

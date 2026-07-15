@@ -1,12 +1,57 @@
 # Genesis Release Note
 
+## 1.2.2
+
+This release introduces a rich family of realistic yet high-throughput tactile sensors that are suitable for training dexterous policy via RL. Besides, non-convex collision detection is now more robust than ever, with comparable performance to convex decomposition in terms of speed and stability. Notably, spurious deep contacts and thin-shell tunneling has been fixed. Finally, enabling 'noslip' post-processing step should now incur less than 20% slowdown for all backends.
+
+### New Features
+
+* Add noise options for tactile sensors: hysteresis, dead taxels, probe gain (@Milotrince) (#2813)
+
+### Breaking changes
+
+* Fix contact-pruning bucket merging. (@duburcqa) (#3010)
+* Fix performance regression on some backends when sparse option is not specified. (@duburcqa) (#3010)
+* Fix data accessors for very large batch sizes (>16k). (@duburcqa) (#3010)
+* More robust nonconvex collision detection. (@duburcqa) (#3014, #3020)
+* Fix go2_backflip RL training example. (@kshitijgoel007) (#2986)
+
+### Miscellaneous
+
+* Speed up per-island noslip solver. (@duburcqa) (#3009)
+* Speed up contact-island constraint solve for large batches. (@Milotrince) (#3021)
+* Speed up tactile sensors. (@Milotrince) (#2922)
+
+## 1.2.1
+
+This release dramatically improves scaling to large scenes on CPU by better leveraging sparsity and incremental Hessian update. Scenes with 100 entities / 1000 geometries now run in real-time at 120FPS.
+
+### Breaking changes
+
+* [BUG FIX] Fix center of mass not properly aligned for composite links. (@duburcqa) (#2993)
+
+### New Features
+
+* Add JointTorqueSensor. (@matthieuvigne) (#2989)
+
+### Bug Fixes
+
+* Fix textures when loading GLB meshes with multiple materials. (@duburcqa) (#2984)
+* More robust watertighten algorithm use for non-convex meshes and inertia estimation. (@duburcqa) (#2994)
+* Fix stale deformable meshes on first rendered frame and wake-up crash during build. (@duburcqa) (#3006)
+
+### Miscellaneous
+
+* More robust convex collision detection. (@duburcqa) (#2999, #3007)
+* Speed up CPU rigid constraint solver. (@duburcqa) (#2992, #2993, #2996, #3001, #3005)
+
 ## 1.2.0
 
 This release dramatically improves scaling to large scenes using islands partitioning, which a now first-class and enabled by default. Besides, the simulation speed is also scaling much better with the number of degrees of freedom per entity.
 
 ### Breaking changes
 
-* Parse kinematic trees depth-first instead of breadth-first. (@duburcqa) (#2972)
+* [MISC] Parse kinematic trees depth-first instead of breadth-first. (@duburcqa) (#2972)
 
 ### New Features
 

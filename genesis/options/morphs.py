@@ -39,6 +39,9 @@ from .options import Options
 URDF_FORMAT = ".urdf"
 XACRO_FORMAT = ".xacro"
 MJCF_FORMAT = ".xml"
+
+# Root tags identifying the format of inline XML content passed as 'FileMorph.file'.
+XML_ROOT_TAG_TO_FORMAT = {"mujoco": MJCF_FORMAT, "robot": URDF_FORMAT}
 GLTF_FORMATS = (".glb", ".gltf")
 MESH_FORMATS = (".obj", ".stl", ".dae", *GLTF_FORMATS)
 USD_FORMATS = (".usd", ".usda", ".usdc", ".usdz")
@@ -537,6 +540,14 @@ class FileMorph(Morph):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 2.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh will be decomposed into multiple convex components if the convex hull is not
@@ -591,7 +602,7 @@ class FileMorph(Morph):
     decimate: StrictBool | None = None
     decimate_face_num: PositiveInt = 500
     decimate_aggressiveness: StrictInt = Field(default=2, ge=0, le=8)
-    watertighten: StrictInt | None = Field(default=7, ge=0, le=8)
+    watertighten: StrictInt | None = Field(default=5, ge=0, le=8)
     convexify: StrictBool | None = None
     decompose_object_error_threshold: float = Field(default=0.15, ge=0, allow_inf_nan=True)
     decompose_robot_error_threshold: float = Field(default=float("inf"), ge=0, allow_inf_nan=True)
@@ -680,7 +691,12 @@ class FileMorph(Morph):
     def is_format(self, format):
         if not isinstance(self.file, (str, os.PathLike)):
             return False
-        return str(self.file).lower().endswith(format)
+        # Inline XML content is identified by its root tag rather than a file extension.
+        try:
+            root_tag = ET.fromstring(self.file).tag
+        except (ET.ParseError, TypeError):
+            return str(self.file).lower().endswith(format)
+        return XML_ROOT_TAG_TO_FORMAT.get(root_tag) == format
 
 
 class Mesh(FileMorph, TetGenMixin):
@@ -719,6 +735,14 @@ class Mesh(FileMorph, TetGenMixin):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 5.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
@@ -907,6 +931,14 @@ class MJCF(FileMorph):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 5.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
@@ -971,13 +1003,7 @@ class MJCF(FileMorph):
         return data
 
     def model_post_init(self, context: Any) -> None:
-        # Inline XML content parses directly and bypasses the file extension check.
-        try:
-            ET.fromstring(self.file)
-            is_inline_xml = True
-        except (ET.ParseError, TypeError):
-            is_inline_xml = False
-        if not is_inline_xml and not self.is_format(MJCF_FORMAT):
+        if not self.is_format(MJCF_FORMAT):
             gs.raise_exception(f"Expected `{MJCF_FORMAT}` extension for MJCF file: {self.file}")
 
     def _identifier(self) -> str:
@@ -1033,6 +1059,14 @@ class URDF(FileMorph):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 5.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
@@ -1166,6 +1200,14 @@ class Drone(FileMorph):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 5.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh with be decomposed into multiple convex components if a single one is not
@@ -1508,6 +1550,14 @@ class USD(FileMorph):
         0 is losseless. 2 preserves all features of the original geometry. 5 may significantly alters the original
         geometry if necessary. 8 does what needs to be done at all costs. Defaults to 2.
         **This is only used for RigidEntity.**
+    watertighten : int, optional
+        Aggressiveness of the watertight wrap built for a non-convex (``convexify=False``) collision mesh, as an
+        integer from 0 to 8 on the same scale as ``decimate_aggressiveness``. The wrap closes an open or
+        self-intersecting mesh into the single watertight surface a grid signed distance field requires, decimating
+        it under a feature-preserving cost cutoff. 0 bypasses the wrap (mesh kept as-is), higher values collapse more
+        of it, and 8 is the strongest decimation the cutoff still allows (every level stays watertight and preserves
+        the closed shape rather than collapsing thin cross-sections). ``None`` skips watertightening altogether.
+        Defaults to 5. **This is only used for RigidEntity.**
     convexify : bool, optional
         Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
         to a set of convex hulls. The mesh will be decomposed into multiple convex components if the convex hull is not
