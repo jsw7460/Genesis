@@ -14,7 +14,7 @@ from genesis.utils.misc import get_assets_dir
 from ..utils import assert_allclose, assert_equal, get_hf_dataset
 
 try:
-    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
 
     from genesis.utils.usd import UsdContext
 except ImportError:
@@ -588,6 +588,64 @@ def normals_mjcf(tmp_path):
     file_path = str(tmp_path / "normals_mjcf.xml")
     ET.ElementTree(mjcf).write(file_path, encoding="utf-8", xml_declaration=True)
     return file_path, str(ico_path)
+
+
+@pytest.fixture
+def textured_mjcf():
+    mjcf = ET.Element("mujoco", model="texture_mapping")
+    default = ET.SubElement(mjcf, "default")
+    ET.SubElement(default, "geom", contype="0", conaffinity="0")
+
+    asset = ET.SubElement(mjcf, "asset")
+    ET.SubElement(asset, "texture", name="checker", type="2d", builtin="checker", width="8", height="8")
+    ET.SubElement(asset, "material", name="repeated", texture="checker", texrepeat="2 2.5")
+    ET.SubElement(asset, "material", name="uniform", texture="checker", texrepeat="2 2.5", texuniform="true")
+
+    MESH_VERTICES = "-1 -2 -3  1 -2 -3  1 2 -3  -1 2 -3  -1 -2 3  1 -2 3  1 2 3  -1 2 3"
+    MESH_FACES = "0 2 1  0 3 2  4 5 6  4 6 7  0 1 5  0 5 4  3 7 6  3 6 2  0 4 7  0 7 3  1 2 6  1 6 5"
+    ET.SubElement(asset, "mesh", name="plain_mesh", vertex=MESH_VERTICES, face=MESH_FACES)
+    ET.SubElement(asset, "mesh", name="plain_mesh_scaled", scale="3 3 3", vertex=MESH_VERTICES, face=MESH_FACES)
+    ET.SubElement(
+        asset,
+        "mesh",
+        name="explicit_mesh",
+        vertex="-1 -1 -1  1 -1 -1  0 1 -1  0 0 1",
+        texcoord="0.125 0.25  0.75 0.25  0.5 0.875  0.625 0.75",
+        face="0 2 1  0 1 3  1 2 3  2 0 3",
+    )
+
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    ET.SubElement(worldbody, "geom", name="plane_repeated", type="plane", size="3 5 0.1", material="repeated")
+    ET.SubElement(worldbody, "geom", name="plane_uniform", type="plane", size="3 5 0.1", material="uniform")
+    ET.SubElement(worldbody, "geom", name="plane_infinite", type="plane", size="0 0 0.1", material="uniform")
+    ET.SubElement(worldbody, "geom", name="sphere_repeated", type="sphere", size="2", material="repeated")
+    ET.SubElement(worldbody, "geom", name="ellipsoid_uniform", type="ellipsoid", size="2 3 4", material="uniform")
+    ET.SubElement(worldbody, "geom", name="capsule_repeated", type="capsule", size="2 3", material="repeated")
+    ET.SubElement(worldbody, "geom", name="cylinder_repeated", type="cylinder", size="2 3", material="repeated")
+    ET.SubElement(worldbody, "geom", name="box_uniform", type="box", size="2 3 4", material="uniform")
+    ET.SubElement(worldbody, "geom", name="mesh_generated", type="mesh", mesh="plain_mesh", material="repeated")
+    ET.SubElement(
+        worldbody,
+        "geom",
+        name="mesh_generated_scaled",
+        type="mesh",
+        mesh="plain_mesh_scaled",
+        material="repeated",
+    )
+    ET.SubElement(worldbody, "geom", name="box_fitted_repeated", type="box", mesh="plain_mesh", material="repeated")
+    ET.SubElement(
+        worldbody,
+        "geom",
+        name="box_fitted_repeated_scaled",
+        type="box",
+        mesh="plain_mesh_scaled",
+        material="repeated",
+    )
+    ET.SubElement(worldbody, "geom", name="box_fitted", type="box", mesh="plain_mesh", material="uniform")
+    ET.SubElement(worldbody, "geom", name="mesh_explicit_a", type="mesh", mesh="explicit_mesh", material="uniform")
+    ET.SubElement(worldbody, "geom", name="mesh_explicit_b", type="mesh", mesh="explicit_mesh", material="uniform")
+
+    return ET.tostring(mjcf, encoding="unicode")
 
 
 @pytest.fixture(scope="session")
@@ -1397,3 +1455,62 @@ def oriented_capsule_usd(asset_tmp_path):
 
     stage.Save()
     return usd_file
+
+
+@pytest.fixture(scope="session")
+def usdz_packaged_texture_usd(asset_tmp_path):
+    """Stage referencing a .usdz package whose mesh material samples a texture packed in the archive, so the
+    texture resolves to a package-internal path (e.g. 'packaged_mesh.usdz[usdz_texture.png]').
+
+    Returns the stage file path and the expected texture pixels.
+    """
+    texture_image = np.arange(4 * 4 * 3, dtype=np.uint8).reshape((4, 4, 3))
+    Image.fromarray(texture_image).save(str(asset_tmp_path / "usdz_texture.png"))
+
+    packaged_file = str(asset_tmp_path / "packaged_mesh.usda")
+    stage = Usd.Stage.CreateNew(packaged_file)
+    UsdGeom.SetStageUpAxis(stage, "Z")
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    root_prim = stage.DefinePrim("/root", "Xform")
+    stage.SetDefaultPrim(root_prim)
+
+    mesh = UsdGeom.Mesh.Define(stage, "/root/mesh")
+    mesh.GetPointsAttr().Set([Gf.Vec3f(0, 0, 0), Gf.Vec3f(1, 0, 0), Gf.Vec3f(0, 1, 0), Gf.Vec3f(1, 1, 0)])
+    mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 1, 3, 2])
+    mesh.GetFaceVertexCountsAttr().Set([3, 3])
+    uv_primvar = UsdGeom.PrimvarsAPI(mesh.GetPrim()).CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+    )
+    uv_primvar.Set([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(0, 1), Gf.Vec2f(1, 1)])
+    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+
+    material = UsdShade.Material.Define(stage, "/root/material")
+    pbr_shader = UsdShade.Shader.Define(stage, "/root/material/pbr")
+    pbr_shader.CreateIdAttr("UsdPreviewSurface")
+    texture_shader = UsdShade.Shader.Define(stage, "/root/material/texture")
+    texture_shader.CreateIdAttr("UsdUVTexture")
+    texture_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set("./usdz_texture.png")
+    st_reader = UsdShade.Shader.Define(stage, "/root/material/st_reader")
+    st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+    st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    texture_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+    pbr_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+        texture_shader.ConnectableAPI(), "rgb"
+    )
+    material.CreateSurfaceOutput().ConnectToSource(pbr_shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+    stage.Save()
+
+    usdz_file = str(asset_tmp_path / "packaged_mesh.usdz")
+    assert UsdUtils.CreateNewUsdzPackage(packaged_file, usdz_file)
+
+    scene_file = str(asset_tmp_path / "usdz_reference_scene.usda")
+    scene_stage = Usd.Stage.CreateNew(scene_file)
+    UsdGeom.SetStageUpAxis(scene_stage, "Z")
+    UsdGeom.SetStageMetersPerUnit(scene_stage, 1.0)
+    world_prim = scene_stage.DefinePrim("/world", "Xform")
+    scene_stage.SetDefaultPrim(world_prim)
+    scene_stage.DefinePrim("/world/asset", "Xform").GetReferences().AddReference("./packaged_mesh.usdz")
+    scene_stage.Save()
+
+    return scene_file, texture_image

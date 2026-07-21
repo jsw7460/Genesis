@@ -433,11 +433,7 @@ class KinematicEntity(Entity):
         g_infos = []
         if morph.visualization:
             g_infos.append(
-                dict(
-                    contype=0,
-                    conaffinity=0,
-                    vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface, metadata=metadata),
-                )
+                dict(contype=0, conaffinity=0, vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface, metadata=metadata))
             )
         if (morph.contype or morph.conaffinity) and morph.collision:
             g_infos.append(
@@ -500,15 +496,7 @@ class KinematicEntity(Entity):
         g_infos = []
         if morph.visualization:
             for mesh in meshes:
-                g_infos.append(
-                    dict(
-                        contype=0,
-                        conaffinity=0,
-                        vmesh=mesh,
-                        pos=gu.zero_pos(),
-                        quat=gu.identity_quat(),
-                    )
-                )
+                g_infos.append(dict(contype=0, conaffinity=0, vmesh=mesh, pos=gu.zero_pos(), quat=gu.identity_quat()))
         if morph.collision:
             if morph.merge_submeshes_for_collision and len(meshes) > 1:
                 # Merge every submesh into a single collision geom if requested.
@@ -555,21 +543,9 @@ class KinematicEntity(Entity):
         link_name = os.path.basename(morph.file).replace(".", "_")
 
         self._add_by_info(
-            l_info=dict(
-                is_robot=False,
-                name=f"{link_name}_baselink",
-                pos=link_pos,
-                quat=link_quat,
-                parent_idx=-1,
-            ),
+            l_info=dict(is_robot=False, name=f"{link_name}_baselink", pos=link_pos, quat=link_quat, parent_idx=-1),
             j_infos=[
-                dict(
-                    name=f"{link_name}_baselink_joint",
-                    n_qs=n_qs,
-                    n_dofs=n_dofs,
-                    type=joint_type,
-                    init_qpos=init_qpos,
-                )
+                dict(name=f"{link_name}_baselink_joint", n_qs=n_qs, n_dofs=n_dofs, type=joint_type, init_qpos=init_qpos)
             ],
             g_infos=g_infos,
             morph=morph,
@@ -583,13 +559,7 @@ class KinematicEntity(Entity):
 
         g_infos = []
         if morph.visualization:
-            g_infos.append(
-                dict(
-                    contype=0,
-                    conaffinity=0,
-                    vmesh=vmesh,
-                )
-            )
+            g_infos.append(dict(contype=0, conaffinity=0, vmesh=vmesh))
         if morph.collision:
             g_infos.append(
                 dict(
@@ -614,14 +584,7 @@ class KinematicEntity(Entity):
                 parent_idx=-1,
                 invweight=None,
             ),
-            j_infos=[
-                dict(
-                    name="joint_baselink",
-                    n_qs=0,
-                    n_dofs=0,
-                    type=gs.JOINT_TYPE.FIXED,
-                )
-            ],
+            j_infos=[dict(name="joint_baselink", n_qs=0, n_dofs=0, type=gs.JOINT_TYPE.FIXED)],
             g_infos=g_infos,
             morph=morph,
             surface=surface,
@@ -637,7 +600,7 @@ class KinematicEntity(Entity):
         # initialized undetermined physics parameters.
         if isinstance(morph, gs.morphs.MJCF):
             # Mujoco's unified MJCF+URDF parser systematically for MJCF files
-            l_infos, links_j_infos, links_g_infos, eqs_info = mju.parse_xml(morph, surface)
+            l_infos, links_j_infos, links_g_infos, eqs_info = mju.parse_xml(morph, surface, self._solver._options)
         elif isinstance(morph, (gs.morphs.URDF, gs.morphs.Drone)):
             # Custom "legacy" URDF parser for loading geometries (visual and collision) and equality constraints.
             # This is necessary because Mujoco cannot parse visual geometries (meshes) reliably for URDF.
@@ -804,11 +767,13 @@ class KinematicEntity(Entity):
             j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (6, 1))
             links_j_infos[0] = [j_info]
 
-            # Shift root idx for all child links and replace root if no longer fixed wrt world
-            for i_l in range(len(l_infos)):
-                l_info = l_infos[i_l]
-                if "root_idx" in l_info and l_info["root_idx"] in (1, i_l):
-                    l_info["root_idx"] = 0
+            # The base link is now moving, which merges every kinematic tree connected to it into a single tree rooted
+            # at it. Parser-provided root indices assume a base welded to the world, so recompute them by propagating
+            # each parent's root (parents precede children); links with no parent root their own tree.
+            for i_l, l_info in enumerate(l_infos):
+                if "root_idx" in l_info:
+                    parent_idx = l_info["parent_idx"]
+                    l_info["root_idx"] = l_infos[parent_idx]["root_idx"] if parent_idx != -1 else i_l
 
             # Must invalidate invweight for all child links and joints because the root joint was fixed when it was
             # initially computed. Re-initialize it to some strictly negative value to trigger recomputation in solver.
@@ -1432,6 +1397,10 @@ class KinematicEntity(Entity):
         Merge two entities to act as single one, by attaching the base link of this entity as a child of a given link of
         another entity.
 
+        The merged pair is simulated as one kinematic tree, whose degrees of freedom must form one contiguous range.
+        This method enforces it: instantiate attached entities consecutively, attach onto the last kinematic tree of a
+        multi-tree parent, and attach all children of an entity onto the same tree.
+
         Parameters
         ----------
         parent_entity : genesis.Entity
@@ -1460,6 +1429,34 @@ class KinematicEntity(Entity):
                 gs.raise_exception(
                     "Attaching fixed-based entity to parent link requires setting Morph option 'batch_fixed_verts=True'."
                 )
+
+        # The merged kinematic tree must keep contiguous DOFs (each mass block is processed as one interval), so every
+        # DOF-carrying link numbered between the target tree's root and this entity must already belong to that tree.
+        # Each violation cause gets its own actionable error.
+        root_link = self._solver.links[parent_link.root_idx]
+        for link in self._solver.links[root_link.idx + 1 : self.link_start]:
+            if link.n_dofs == 0 or link.root_idx == root_link.idx:
+                continue
+            foreign_root_link = self._solver.links[link.root_idx]
+            if foreign_root_link.entity is root_link.entity:
+                is_foreign_tree_merged = any(
+                    other_link.root_idx == link.root_idx and other_link.entity is not foreign_root_link.entity
+                    for other_link in self._solver.links[link.root_idx :]
+                )
+                if is_foreign_tree_merged:
+                    gs.raise_exception(
+                        "Attaching entities onto different kinematic trees of the same parent entity is not "
+                        "supported. Load the parent's trees as separate entities."
+                    )
+                gs.raise_exception(
+                    "Attaching an entity onto a kinematic tree that is not the last one declared in its file is not "
+                    "supported. Declare the attached-onto tree last, or load the file's other trees as separate "
+                    "entities."
+                )
+            gs.raise_exception(
+                "Creating entities between attached entities is not supported. Instantiate attached entities "
+                "consecutively."
+            )
 
         # Remove all root joints if necessary.
         # The requires shifting joint and dof indices of all subsequent entities.
@@ -1497,20 +1494,14 @@ class KinematicEntity(Entity):
         # Overwrite parent link
         base_link._parent_idx = parent_link.idx
 
-        for link in self.links:
-            # Break as soon as the root idx is -1, because the following links correspond to a different kinematic tree
-            if link.root_idx == -1:
-                break
-
-            # Override root idx for child links
-            assert link.root_idx == base_link.idx
-            link._root_idx = parent_link.root_idx
-
-            # Update fixed link flag
-            link._is_fixed &= parent_link.is_fixed
-
-            # Must invalidate invweight for all child links and joints
-            link._invweight = None
+        # Re-root the whole tree hanging from this entity's base link - scene-wide, because entities previously
+        # attached into this one already share its root and must follow it (chained attaches may run in any order);
+        # links of other trees declared in the same file keep their own root, as do the fixed flag and invweight.
+        for link in self._solver.links:
+            if link.root_idx == base_link.idx:
+                link._root_idx = parent_link.root_idx
+                link._is_fixed &= parent_link.is_fixed
+                link._invweight = None
 
         self._is_attached = True
 
@@ -1573,9 +1564,7 @@ class KinematicEntity(Entity):
                     # [velocity] could be None when we want to zero the velocity (see set_dofs_velocity of RigidSolver)
                     if velocity is not None and velocity.requires_grad:
                         velocity._backward_from_qd(
-                            self.set_dofs_velocity_grad,
-                            data_kwargs["dofs_idx_local"],
-                            data_kwargs["envs_idx"],
+                            self.set_dofs_velocity_grad, data_kwargs["dofs_idx_local"], data_kwargs["envs_idx"]
                         )
                 case _:
                     gs.raise_exception(f"Invalid target key: {key} not in {self._tgt_keys}")
@@ -2339,8 +2328,8 @@ class KinematicEntity(Entity):
             return self._solver.get_vverts(self._custom_vvert_start, self._custom_vvert_start + self.n_vverts, envs_idx)
 
         self._solver.update_vgeoms()
-        vgeoms_pos = qd_to_torch(self._solver.vgeoms_state.pos, envs_idx, transpose=True, copy=None)
-        vgeoms_quat = qd_to_torch(self._solver.vgeoms_state.quat, envs_idx, transpose=True, copy=None)
+        vgeoms_pos = qd_to_torch(self._solver.dyn_state.vgeoms.pos, envs_idx, transpose=True, copy=None)
+        vgeoms_quat = qd_to_torch(self._solver.dyn_state.vgeoms.quat, envs_idx, transpose=True, copy=None)
         parts = []
         for vgeom in self.vgeoms:
             init = torch.as_tensor(vgeom.init_vverts, dtype=gs.tc_float, device=gs.device)
@@ -2460,6 +2449,12 @@ class RigidEntity(KinematicEntity):
             friction = self.material.friction
             if friction is None:
                 friction = g_info.get("friction", gu.default_friction())
+            friction_torsional = self.material.friction_torsional
+            if friction_torsional is None:
+                friction_torsional = g_info.get("friction_torsional", gu.default_friction_torsional())
+            friction_rolling = self.material.friction_rolling
+            if friction_rolling is None:
+                friction_rolling = g_info.get("friction_rolling", gu.default_friction_rolling())
             needs_coup = self.material.needs_coup and (coup_links is None or link.name in coup_links)
             link._add_geom(
                 mesh=g_info["mesh"],
@@ -2467,6 +2462,8 @@ class RigidEntity(KinematicEntity):
                 init_quat=g_info.get("quat", gu.identity_quat()),
                 type=g_info["type"],
                 friction=friction,
+                friction_torsional=friction_torsional,
+                friction_rolling=friction_rolling,
                 sol_params=g_info["sol_params"],
                 data=g_info.get("data"),
                 needs_coup=needs_coup,
@@ -2718,6 +2715,12 @@ class RigidEntity(KinematicEntity):
             friction = self.material.friction
             if friction is None:
                 friction = g_info.get("friction", gu.default_friction())
+            friction_torsional = self.material.friction_torsional
+            if friction_torsional is None:
+                friction_torsional = g_info.get("friction_torsional", gu.default_friction_torsional())
+            friction_rolling = self.material.friction_rolling
+            if friction_rolling is None:
+                friction_rolling = g_info.get("friction_rolling", gu.default_friction_rolling())
             needs_coup = self.material.needs_coup and (coup_links is None or link.name in coup_links)
             link._add_geom(
                 mesh=g_info["mesh"],
@@ -2725,6 +2728,8 @@ class RigidEntity(KinematicEntity):
                 init_quat=g_info.get("quat", gu.identity_quat()),
                 type=g_info["type"],
                 friction=friction,
+                friction_torsional=friction_torsional,
+                friction_rolling=friction_rolling,
                 sol_params=g_info["sol_params"],
                 data=g_info.get("data"),
                 needs_coup=needs_coup,
@@ -2796,28 +2801,13 @@ class RigidEntity(KinematicEntity):
 
         if local_point is None:
             sol = self._solver
-            self._kernel_get_jacobian_zero(
-                tgt_link_idx=link.idx,
-                dofs_info=sol.dofs_info,
-                joints_info=sol.joints_info,
-                joints_state=sol.joints_state,
-                links_info=sol.links_info,
-                links_state=sol.links_state,
-            )
+            self._kernel_get_jacobian_zero(link.idx, sol.dyn_state, sol.dyn_info)
         else:
             p_local = torch.as_tensor(local_point, dtype=gs.tc_float, device=gs.device)
             if p_local.shape != (3,):
                 gs.raise_exception("Must be a vector of length 3")
             sol = self._solver
-            self._kernel_get_jacobian(
-                tgt_link_idx=link.idx,
-                p_local=p_local,
-                dofs_info=sol.dofs_info,
-                joints_info=sol.joints_info,
-                joints_state=sol.joints_state,
-                links_info=sol.links_info,
-                links_state=sol.links_state,
-            )
+            self._kernel_get_jacobian(link.idx, p_local, sol.dyn_state, sol.dyn_info)
 
         jacobian = qd_to_torch(self._jacobian, transpose=True, copy=True)
         if self._solver.n_envs == 0:
@@ -2827,27 +2817,10 @@ class RigidEntity(KinematicEntity):
 
     @qd.func
     def _impl_get_jacobian(
-        self,
-        tgt_link_idx,
-        i_b,
-        p_vec,
-        dofs_info: array_class.DofsInfo,
-        joints_info: array_class.JointsInfo,
-        joints_state: array_class.JointsState,
-        links_info: array_class.LinksInfo,
-        links_state: array_class.LinksState,
+        self, tgt_link_idx, i_b, p_vec, dyn_state: array_class.DynState, dyn_info: array_class.DynInfo
     ):
         self._func_get_jacobian(
-            tgt_link_idx=tgt_link_idx,
-            i_b=i_b,
-            p_local=p_vec,
-            pos_mask=qd.Vector.one(gs.qd_int, 3),
-            rot_mask=qd.Vector.one(gs.qd_int, 3),
-            dofs_info=dofs_info,
-            joints_info=joints_info,
-            joints_state=joints_state,
-            links_info=links_info,
-            links_state=links_state,
+            tgt_link_idx, i_b, p_vec, qd.Vector.one(gs.qd_int, 3), qd.Vector.one(gs.qd_int, 3), dyn_state, dyn_info
         )
 
     @qd.kernel
@@ -2855,46 +2828,19 @@ class RigidEntity(KinematicEntity):
         self,
         tgt_link_idx: qd.i32,
         p_local: qd.types.ndarray(),
-        dofs_info: array_class.DofsInfo,
-        joints_info: array_class.JointsInfo,
-        joints_state: array_class.JointsState,
-        links_info: array_class.LinksInfo,
-        links_state: array_class.LinksState,
+        dyn_state: array_class.DynState,
+        dyn_info: array_class.DynInfo,
     ):
         p_vec = qd.Vector([p_local[0], p_local[1], p_local[2]], dt=gs.qd_float)
         for i_b in range(self._solver._B):
-            self._impl_get_jacobian(
-                tgt_link_idx=tgt_link_idx,
-                i_b=i_b,
-                p_vec=p_vec,
-                dofs_info=dofs_info,
-                joints_info=joints_info,
-                joints_state=joints_state,
-                links_info=links_info,
-                links_state=links_state,
-            )
+            self._impl_get_jacobian(tgt_link_idx, i_b, p_vec, dyn_state, dyn_info)
 
     @qd.kernel
     def _kernel_get_jacobian_zero(
-        self,
-        tgt_link_idx: qd.i32,
-        dofs_info: array_class.DofsInfo,
-        joints_info: array_class.JointsInfo,
-        joints_state: array_class.JointsState,
-        links_info: array_class.LinksInfo,
-        links_state: array_class.LinksState,
+        self, tgt_link_idx: qd.i32, dyn_state: array_class.DynState, dyn_info: array_class.DynInfo
     ):
         for i_b in range(self._solver._B):
-            self._impl_get_jacobian(
-                tgt_link_idx=tgt_link_idx,
-                i_b=i_b,
-                p_vec=qd.Vector.zero(gs.qd_float, 3),
-                dofs_info=dofs_info,
-                joints_info=joints_info,
-                joints_state=joints_state,
-                links_info=links_info,
-                links_state=links_state,
-            )
+            self._impl_get_jacobian(tgt_link_idx, i_b, qd.Vector.zero(gs.qd_float, 3), dyn_state, dyn_info)
 
     @qd.func
     def _func_get_jacobian(
@@ -2904,32 +2850,29 @@ class RigidEntity(KinematicEntity):
         p_local,
         pos_mask,
         rot_mask,
-        dofs_info: array_class.DofsInfo,
-        joints_info: array_class.JointsInfo,
-        joints_state: array_class.JointsState,
-        links_info: array_class.LinksInfo,
-        links_state: array_class.LinksState,
+        dyn_state: array_class.DynState,
+        dyn_info: array_class.DynInfo,
     ):
         for i_row, i_d in qd.ndrange(6, self.n_dofs):
             self._jacobian[i_row, i_d, i_b] = 0.0
 
-        tgt_link_pos = links_state.pos[tgt_link_idx, i_b] + gu.qd_transform_by_quat(
-            p_local, links_state.quat[tgt_link_idx, i_b]
+        tgt_link_pos = dyn_state.links.pos[tgt_link_idx, i_b] + gu.qd_transform_by_quat(
+            p_local, dyn_state.links.quat[tgt_link_idx, i_b]
         )
         i_l = tgt_link_idx
         while i_l > -1:
             I_l = [i_l, i_b] if qd.static(self.solver._options.batch_links_info) else i_l
 
-            for i_j in range(links_info.joint_start[I_l], links_info.joint_end[I_l]):
+            for i_j in range(dyn_info.links.joint_start[I_l], dyn_info.links.joint_end[I_l]):
                 I_j = [i_j, i_b] if qd.static(self.solver._options.batch_joints_info) else i_j
 
-                if joints_info.type[I_j] == gs.JOINT_TYPE.FIXED:
+                if dyn_info.joints.type[I_j] == gs.JOINT_TYPE.FIXED:
                     pass
 
-                elif joints_info.type[I_j] == gs.JOINT_TYPE.REVOLUTE:
-                    i_d_jac = joints_info.dof_start[I_j] - self._dof_start
-                    rotation = joints_state.xaxis[i_j, i_b]
-                    translation = rotation.cross(tgt_link_pos - joints_state.xanchor[i_j, i_b])
+                elif dyn_info.joints.type[I_j] == gs.JOINT_TYPE.REVOLUTE:
+                    i_d_jac = dyn_info.joints.dof_start[I_j] - self._dof_start
+                    rotation = dyn_state.joints.xaxis[i_j, i_b]
+                    translation = rotation.cross(tgt_link_pos - dyn_state.joints.xanchor[i_j, i_b])
 
                     self._jacobian[0, i_d_jac, i_b] = translation[0] * pos_mask[0]
                     self._jacobian[1, i_d_jac, i_b] = translation[1] * pos_mask[1]
@@ -2938,28 +2881,28 @@ class RigidEntity(KinematicEntity):
                     self._jacobian[4, i_d_jac, i_b] = rotation[1] * rot_mask[1]
                     self._jacobian[5, i_d_jac, i_b] = rotation[2] * rot_mask[2]
 
-                elif joints_info.type[I_j] == gs.JOINT_TYPE.PRISMATIC:
-                    i_d_jac = joints_info.dof_start[I_j] - self._dof_start
-                    translation = joints_state.xaxis[i_j, i_b]
+                elif dyn_info.joints.type[I_j] == gs.JOINT_TYPE.PRISMATIC:
+                    i_d_jac = dyn_info.joints.dof_start[I_j] - self._dof_start
+                    translation = dyn_state.joints.xaxis[i_j, i_b]
 
                     self._jacobian[0, i_d_jac, i_b] = translation[0] * pos_mask[0]
                     self._jacobian[1, i_d_jac, i_b] = translation[1] * pos_mask[1]
                     self._jacobian[2, i_d_jac, i_b] = translation[2] * pos_mask[2]
 
-                elif joints_info.type[I_j] == gs.JOINT_TYPE.FREE:
+                elif dyn_info.joints.type[I_j] == gs.JOINT_TYPE.FREE:
                     # translation
                     for i_d_ in qd.static(range(3)):
-                        i_d_jac = joints_info.dof_start[I_j] + i_d_ - self._dof_start
+                        i_d_jac = dyn_info.joints.dof_start[I_j] + i_d_ - self._dof_start
 
                         self._jacobian[i_d_, i_d_jac, i_b] = 1.0 * pos_mask[i_d_]
 
                     # rotation
                     for i_d_ in qd.static(range(3)):
-                        i_d = joints_info.dof_start[I_j] + i_d_ + 3
+                        i_d = dyn_info.joints.dof_start[I_j] + i_d_ + 3
                         i_d_jac = i_d - self._dof_start
                         I_d = [i_d, i_b] if qd.static(self.solver._options.batch_dofs_info) else i_d
-                        rotation = dofs_info.motion_ang[I_d]
-                        translation = rotation.cross(tgt_link_pos - links_state.pos[i_l, i_b])
+                        rotation = dyn_info.dofs.motion_ang[I_d]
+                        translation = rotation.cross(tgt_link_pos - dyn_state.links.pos[i_l, i_b])
 
                         self._jacobian[0, i_d_jac, i_b] = translation[0] * pos_mask[0]
                         self._jacobian[1, i_d_jac, i_b] = translation[1] * pos_mask[1]
@@ -2968,7 +2911,7 @@ class RigidEntity(KinematicEntity):
                         self._jacobian[4, i_d_jac, i_b] = rotation[1] * rot_mask[1]
                         self._jacobian[5, i_d_jac, i_b] = rotation[2] * rot_mask[2]
 
-            i_l = links_info.parent_idx[I_l]
+            i_l = dyn_info.links.parent_idx[I_l]
 
     @gs.assert_built
     def inverse_kinematics(
@@ -3246,35 +3189,30 @@ class RigidEntity(KinematicEntity):
         links_idx = torch.tensor([link.idx for link in links], dtype=gs.tc_int, device=gs.device)
 
         kernel_rigid_entity_inverse_kinematics(
-            self,
             links_idx,
+            dofs_idx,
+            envs_idx,
+            self,
             poss,
             quats,
             local_points,
-            dofs_idx,
-            custom_init_qpos,
             init_qpos,
+            pos_mask,
+            rot_mask,
+            link_pos_mask,
+            link_rot_mask,
+            self._solver.dyn_state,
+            self._solver.dyn_info,
+            self._solver.rigid_info,
+            self._solver.rigid_config,
+            custom_init_qpos,
             max_samples,
             max_solver_iters,
             damping,
             pos_tol,
             rot_tol,
-            pos_mask,
-            rot_mask,
-            link_pos_mask,
-            link_rot_mask,
             max_step_size,
             respect_joint_limit,
-            envs_idx,
-            self._solver.links_state,
-            self._solver.links_info,
-            self._solver.joints_state,
-            self._solver.joints_info,
-            self._solver.dofs_state,
-            self._solver.dofs_info,
-            self._solver.entities_info,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
         )
 
         qpos = qd_to_torch(self._IK_qpos_best, transpose=True, copy=True)
@@ -3326,21 +3264,16 @@ class RigidEntity(KinematicEntity):
         links_quat = torch.empty((len(envs_idx), len(links_idx), 4), dtype=gs.tc_float, device=gs.device)
 
         self._kernel_forward_kinematics(
-            links_pos,
-            links_quat,
-            qpos,
             self._get_global_idx(qs_idx_local, self.n_qs, self._q_start),
             links_idx,
             envs_idx,
-            self._solver.links_state,
-            self._solver.links_info,
-            self._solver.joints_state,
-            self._solver.joints_info,
-            self._solver.dofs_state,
-            self._solver.dofs_info,
-            self._solver.entities_info,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
+            links_pos,
+            links_quat,
+            qpos,
+            self._solver.dyn_state,
+            self._solver.dyn_info,
+            self._solver.rigid_info,
+            self._solver.rigid_config,
         )
 
         if self._solver.n_envs == 0:
@@ -3351,76 +3284,49 @@ class RigidEntity(KinematicEntity):
     @qd.kernel
     def _kernel_forward_kinematics(
         self,
-        links_pos: qd.types.ndarray(),
-        links_quat: qd.types.ndarray(),
-        qpos: qd.types.ndarray(),
         qs_idx: qd.types.ndarray(),
         links_idx: qd.types.ndarray(),
         envs_idx: qd.types.ndarray(),
-        links_state: array_class.LinksState,
-        links_info: array_class.LinksInfo,
-        joints_state: array_class.JointsState,
-        joints_info: array_class.JointsInfo,
-        dofs_state: array_class.DofsState,
-        dofs_info: array_class.DofsInfo,
-        entities_info: array_class.EntitiesInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
-        static_rigid_sim_config: qd.template(),
+        links_pos: qd.types.ndarray(),
+        links_quat: qd.types.ndarray(),
+        qpos: qd.types.ndarray(),
+        dyn_state: array_class.DynState,
+        dyn_info: array_class.DynInfo,
+        rigid_info: array_class.RigidInfo,
+        rigid_config: qd.template(),
     ):
-        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
         for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0]):
             # save original qpos
             # NOTE: reusing the IK_qpos_orig as cache (should not be a problem)
-            self._IK_qpos_orig[qs_idx[i_q_], envs_idx[i_b_]] = rigid_global_info.qpos[qs_idx[i_q_], envs_idx[i_b_]]
+            self._IK_qpos_orig[qs_idx[i_q_], envs_idx[i_b_]] = rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]]
             # set new qpos
-            rigid_global_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = qpos[i_b_, i_q_]
+            rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = qpos[i_b_, i_q_]
 
         # run FK
-        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b_ in range(envs_idx.shape[0]):
             gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
-                self._idx_in_solver,
-                envs_idx[i_b_],
-                links_state,
-                links_info,
-                joints_state,
-                joints_info,
-                dofs_state,
-                dofs_info,
-                entities_info,
-                rigid_global_info,
-                static_rigid_sim_config,
-                is_backward=False,
+                self._idx_in_solver, envs_idx[i_b_], dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False
             )
 
-        qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+        qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
         for i_l_, i_b_ in qd.ndrange(links_idx.shape[0], envs_idx.shape[0]):
             for i in qd.static(range(3)):
-                links_pos[i_b_, i_l_, i] = links_state.pos[links_idx[i_l_], envs_idx[i_b_]][i]
+                links_pos[i_b_, i_l_, i] = dyn_state.links.pos[links_idx[i_l_], envs_idx[i_b_]][i]
             for i in qd.static(range(4)):
-                links_quat[i_b_, i_l_, i] = links_state.quat[links_idx[i_l_], envs_idx[i_b_]][i]
+                links_quat[i_b_, i_l_, i] = dyn_state.links.quat[links_idx[i_l_], envs_idx[i_b_]][i]
 
         # restore original qpos
-        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
         for i_q_, i_b_ in qd.ndrange(qs_idx.shape[0], envs_idx.shape[0]):
-            rigid_global_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = self._IK_qpos_orig[qs_idx[i_q_], envs_idx[i_b_]]
+            rigid_info.qpos[qs_idx[i_q_], envs_idx[i_b_]] = self._IK_qpos_orig[qs_idx[i_q_], envs_idx[i_b_]]
 
         # run FK
-        qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+        qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b_ in range(envs_idx.shape[0]):
             gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
-                self._idx_in_solver,
-                envs_idx[i_b_],
-                links_state,
-                links_info,
-                joints_state,
-                joints_info,
-                dofs_state,
-                dofs_info,
-                entities_info,
-                rigid_global_info,
-                static_rigid_sim_config,
-                is_backward=False,
+                self._idx_in_solver, envs_idx[i_b_], dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False
             )
 
     # ------------------------------------------------------------------------------------
@@ -3799,11 +3705,11 @@ class RigidEntity(KinematicEntity):
 
         if n_fixed_verts > 0:
             verts_idx = slice(self._fixed_verts_state_start, self._fixed_verts_state_start + n_fixed_verts)
-            fixed_verts_state = qd_to_torch(self._solver.fixed_verts_state.pos, verts_idx)
+            fixed_verts_state = qd_to_torch(self._solver.dyn_state.fixed_verts.pos, verts_idx)
             tensor[:, self._fixed_verts_idx_local] = fixed_verts_state
         if n_free_vertices > 0:
             verts_idx = slice(self._free_verts_state_start, self._free_verts_state_start + n_free_vertices)
-            free_verts_state = qd_to_torch(self._solver.free_verts_state.pos, None, verts_idx, transpose=True)
+            free_verts_state = qd_to_torch(self._solver.dyn_state.free_verts.pos, None, verts_idx, transpose=True)
             tensor[:, self._free_verts_idx_local] = free_verts_state
 
         if self._solver.n_envs == 0:
@@ -4301,17 +4207,14 @@ class RigidEntity(KinematicEntity):
         -------
         kinetic_energy : torch.Tensor, shape () or (n_envs,)
         """
-        if self._solver._static_rigid_sim_config.integrator == gs.integrator.approximate_implicitfast:
+        if self._solver.rigid_config.integrator == gs.integrator.approximate_implicitfast:
             from genesis.engine.solvers.rigid.abd.forward_dynamics import kernel_compute_mass_matrix
 
             kernel_compute_mass_matrix(
-                links_state=self._solver.links_state,
-                links_info=self._solver.links_info,
-                dofs_state=self._solver.dofs_state,
-                dofs_info=self._solver.dofs_info,
-                entities_info=self._solver.entities_info,
-                rigid_global_info=self._solver._rigid_global_info,
-                static_rigid_sim_config=self._solver._static_rigid_sim_config,
+                self._solver.dyn_state,
+                self._solver.dyn_info,
+                self._solver.rigid_info,
+                self._solver.rigid_config,
                 decompose=False,
             )
         mass_mat = self.get_mass_mat(envs_idx=envs_idx)
@@ -4378,10 +4281,7 @@ class RigidEntity(KinematicEntity):
 
         all_collision_pairs = self._solver.detect_collision(env_idx)
         collision_pairs = all_collision_pairs[
-            np.logical_and(
-                all_collision_pairs >= self.geom_start,
-                all_collision_pairs < self.geom_end,
-            ).any(axis=1)
+            np.logical_and(all_collision_pairs >= self.geom_start, all_collision_pairs < self.geom_end).any(axis=1)
         ]
         return collision_pairs
 
@@ -4433,26 +4333,18 @@ class RigidEntity(KinematicEntity):
             logical_operation = torch.logical_and
 
         valid_mask = logical_operation(
-            torch.logical_and(
-                contact_data["geom_a"] >= self.geom_start,
-                contact_data["geom_a"] < self.geom_end,
-            ),
-            torch.logical_and(
-                contact_data["geom_b"] >= self.geom_start,
-                contact_data["geom_b"] < self.geom_end,
-            ),
+            torch.logical_and(contact_data["geom_a"] >= self.geom_start, contact_data["geom_a"] < self.geom_end),
+            torch.logical_and(contact_data["geom_b"] >= self.geom_start, contact_data["geom_b"] < self.geom_end),
         )
         if with_entity is not None and self.idx != with_entity.idx:
             valid_mask = torch.logical_and(
                 valid_mask,
                 torch.logical_or(
                     torch.logical_and(
-                        contact_data["geom_a"] >= with_entity.geom_start,
-                        contact_data["geom_a"] < with_entity.geom_end,
+                        contact_data["geom_a"] >= with_entity.geom_start, contact_data["geom_a"] < with_entity.geom_end
                     ),
                     torch.logical_and(
-                        contact_data["geom_b"] >= with_entity.geom_start,
-                        contact_data["geom_b"] < with_entity.geom_end,
+                        contact_data["geom_b"] >= with_entity.geom_start, contact_data["geom_b"] < with_entity.geom_end
                     ),
                 ),
             )
@@ -4478,7 +4370,7 @@ class RigidEntity(KinematicEntity):
             The net force applied on each links due to direct external contacts.
         """
         links_idx = slice(self.link_start, self.link_end)
-        tensor = qd_to_torch(self._solver.links_state.contact_force, envs_idx, links_idx, transpose=True, copy=True)
+        tensor = qd_to_torch(self._solver.dyn_state.links.contact_force, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self._solver.n_envs == 0 else tensor
 
     # ------------------------------------------------------------------------------------
@@ -4535,6 +4427,48 @@ class RigidEntity(KinematicEntity):
 
         for link in self._links:
             link.set_friction(friction)
+
+    def set_friction_torsional(self, friction_torsional):
+        """
+        Set the torsional friction coefficient of all the links (and in turn, geometries) of the rigid entity.
+
+        Note
+        ----
+        The torsional friction coefficient associated with a pair of geometries in contact is defined as the maximum
+        between their respective values (see 'gs.materials.Rigid'). Only effective when torsional friction is enabled
+        at the scene level (see 'RigidOptions.enable_torsional_friction').
+
+        Parameters
+        ----------
+        friction_torsional : float
+            The torsional friction coefficient to set.
+        """
+        if friction_torsional < 0:
+            gs.raise_exception("`friction_torsional` must be non-negative.")
+
+        for link in self._links:
+            link.set_friction_torsional(friction_torsional)
+
+    def set_friction_rolling(self, friction_rolling):
+        """
+        Set the rolling friction coefficient of all the links (and in turn, geometries) of the rigid entity.
+
+        Note
+        ----
+        The rolling friction coefficient associated with a pair of geometries in contact is defined as the maximum
+        between their respective values (see 'gs.materials.Rigid'). Only effective when rolling friction is enabled
+        at the scene level (see 'RigidOptions.enable_rolling_friction').
+
+        Parameters
+        ----------
+        friction_rolling : float
+            The rolling friction coefficient to set.
+        """
+        if friction_rolling < 0:
+            gs.raise_exception("`friction_rolling` must be non-negative.")
+
+        for link in self._links:
+            link.set_friction_rolling(friction_rolling)
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- mass / inertia -----------------------------------
@@ -4615,7 +4549,7 @@ class RigidEntity(KinematicEntity):
         """
         if self._enable_heterogeneous:
             links_idx = slice(self.link_start, self.link_end)
-            links_mass = qd_to_numpy(self._solver.links_info.inertial_mass, None, links_idx, transpose=True)
+            links_mass = qd_to_numpy(self._solver.dyn_info.links.inertial_mass, None, links_idx, transpose=True)
             return links_mass.sum(axis=1)
 
         # Original behavior: sum link masses to scalar
