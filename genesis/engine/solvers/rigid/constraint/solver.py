@@ -448,12 +448,13 @@ class ConstraintSolver:
             self._solver.rigid_config,
         )
 
-    def backward(self, dL_dqacc):
+    def backward(self):
+        """Adjoint solve of the constraint force computation.
+
+        The caller must pre-populate the upstream gradient constraint_state.dL_dqacc (see
+        RigidSolver._constraint_force_grad)."""
         if not self._solver._requires_grad:
             gs.raise_exception("Please set `requires_grad` to True in SimOptions to enable differentiable mode.")
-
-        # Copy upstream gradients
-        self.constraint_state.dL_dqacc.from_numpy(dL_dqacc)
 
         # 1. We first need to find a solution to A^T * u = g system.
         backward_constraint_solver.kernel_solve_adjoint_u(
@@ -2764,7 +2765,7 @@ def func_island_tiled_factor_solve_all(
     MAX_DOFS = qd.static(rigid_config.tiled_n_island_dofs)
     T = qd.static(rigid_config.cholesky_tile_size)
     n_work = constraint_state.island.factor_worklist_size[0]
-    qd.loop_config(block_dim=T)
+    qd.loop_config(name="island_tiled_factor_solve", block_dim=T)
     for i in range(N_BLOCKS * T):
         blk = i // T
         tid = i % T
@@ -5645,16 +5646,7 @@ def func_update_gradient_batch(
         )
 
     if qd.static(rigid_config.solver_type == gs.constraint_solver.CG):
-        func_solve_mass_batch(
-            i_b,
-            constraint_state.grad,
-            constraint_state.Mgrad,
-            out_bw=None,
-            dyn_info=dyn_info,
-            rigid_info=rigid_info,
-            rigid_config=rigid_config,
-            is_backward=False,
-        )
+        func_solve_mass_batch(i_b, constraint_state.grad, constraint_state.Mgrad, dyn_info, rigid_info, rigid_config)
 
     if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton):
         if qd.static(rigid_config.enable_per_island_solve):
@@ -5725,14 +5717,7 @@ def func_update_gradient_tiled(
         )
         for i_b in range(_B):
             func_solve_mass_batch(
-                i_b,
-                constraint_state.grad,
-                constraint_state.Mgrad,
-                out_bw=None,
-                dyn_info=dyn_info,
-                rigid_info=rigid_info,
-                rigid_config=rigid_config,
-                is_backward=False,
+                i_b, constraint_state.grad, constraint_state.Mgrad, dyn_info, rigid_info, rigid_config
             )
 
     if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton):

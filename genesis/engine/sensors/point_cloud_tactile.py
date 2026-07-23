@@ -11,8 +11,10 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
 from genesis.engine.bvh import STACK_SIZE as _BVH_STACK_SIZE
-from genesis.options.sensors import ElastomerTaxel as ElastomerTaxelSensorOptions
-from genesis.options.sensors import ProximityTaxel as ProximityTaxelOptions
+from genesis.options.sensors import (
+    ElastomerTaxel as ElastomerTaxelSensorOptions,
+    ProximityTaxel as ProximityTaxelOptions,
+)
 from genesis.utils.misc import concat_with_tensor, make_tensor_field, tensor_to_array
 from genesis.utils.point_cloud import sample_mesh_point_cloud
 from genesis.utils.raycast_qd import closest_point_on_triangle, get_triangle_vertices, triangle_face_normal
@@ -363,6 +365,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
     probe_gains: qd.types.ndarray(),
     stiffness: qd.types.ndarray(),
     shear_coupling: qd.types.ndarray(),
+    twist_scalar: qd.types.ndarray(),
     proximity_density_scale: qd.types.ndarray(),
     output_gt: qd.types.ndarray(),
     output_measured: qd.types.ndarray(),
@@ -381,6 +384,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
 
         k_stiff = stiffness[i_s]
         k_shear = shear_coupling[i_s]
+        k_twist = twist_scalar[i_s]
         dens = proximity_density_scale[i_s, i_b]
         n_probes = n_probes_per_sensor[i_s]
         cache_start = sensor_cache_start[i_s]
@@ -415,10 +419,10 @@ def _kernel_point_cloud_proximity_taxel_bvh(
 
         sum_p_gt = gs.qd_float(0.0)
         fv_gt = qd.Vector.zero(gs.qd_float, 3)
-        tau_w_gt = qd.Vector.zero(gs.qd_float, 3)
+        omega_w_gt = gs.qd_float(0.0)
         sum_p_m = gs.qd_float(0.0)
         fv_m = qd.Vector.zero(gs.qd_float, 3)
-        tau_w_m = qd.Vector.zero(gs.qd_float, 3)
+        omega_w_m = gs.qd_float(0.0)
 
         chunk_start = bvh.sensor_chunk_start[i_s]
         n_chunks = bvh.sensor_chunk_count[i_s]
@@ -430,6 +434,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
             rcom_o = dyn_state.links.root_COM[track_link_idx, i_b]
             cdv_o = dyn_state.links.cd_vel[track_link_idx, i_b]
             cda_o = dyn_state.links.cd_ang[track_link_idx, i_b]
+            omega_c = (cda_o - s_ang).dot(a_w)  # Relative spin rate of the tracked link about the normal
             # BVH nodes live in tracked-link local frame: bring the probe sphere center over.
             probe_link = gu.qd_inv_transform_by_trans_quat(probe_world, track_pos, track_quat)
 
@@ -460,9 +465,8 @@ def _kernel_point_cloud_proximity_taxel_bvh(
                         hit_gt = dsq <= R_gt_sq and dist > eps
                         hit_m = use_noised_radius and dsq <= R_m_sq and dist > eps
                         if hit_gt or hit_m:
-                            # Same-frame conversion: dvec_world = R_track * d_link, and the world
-                            # point pw is reachable via probe_world + dvec_world (equivalent to
-                            # track_pos + R_track * pos_l, up to float order).
+                            # d_link is the probe->point offset in the tracked-link frame; rotating it to world
+                            # and adding to probe_world yields the point's world position without a second transform.
                             d_world = gu.qd_transform_by_quat(d_link, track_quat)
                             pw = probe_world + d_world
                             v_pc = cdv_o + cda_o.cross(pw - rcom_o)
@@ -471,22 +475,21 @@ def _kernel_point_cloud_proximity_taxel_bvh(
                             v_t = qd.Vector.zero(gs.qd_float, 3)
                             for k2 in qd.static(range(3)):
                                 v_t[k2] = v_rel[k2] - a_w[k2] * vdota
-                            ctmp = d_world.cross(a_w)
 
                             if hit_gt:
                                 P_i_gt = R_gt - dist
                                 if P_i_gt > 0.0:
                                     sum_p_gt = sum_p_gt + P_i_gt
+                                    omega_w_gt = omega_w_gt + P_i_gt * omega_c
                                     for k2 in qd.static(range(3)):
                                         fv_gt[k2] = fv_gt[k2] + P_i_gt * v_t[k2]
-                                        tau_w_gt[k2] = tau_w_gt[k2] + P_i_gt * ctmp[k2]
                             if hit_m:
                                 P_i_m = R_m - dist
                                 if P_i_m > 0.0:
                                     sum_p_m = sum_p_m + P_i_m
+                                    omega_w_m = omega_w_m + P_i_m * omega_c
                                     for k2 in qd.static(range(3)):
                                         fv_m[k2] = fv_m[k2] + P_i_m * v_t[k2]
-                                        tau_w_m[k2] = tau_w_m[k2] + P_i_m * ctmp[k2]
                 else:
                     right = bvh.node_right[n]
                     # Median split bounds depth at log2(N / leaf_size) << BVH_STACK_SIZE; the guard mirrors the
@@ -498,58 +501,70 @@ def _kernel_point_cloud_proximity_taxel_bvh(
 
         if not use_noised_radius:
             sum_p_m = sum_p_gt
+            omega_w_m = omega_w_gt
             for j in qd.static(range(3)):
                 fv_m[j] = fv_gt[j]
-                tau_w_m[j] = tau_w_gt[j]
 
-        # Per-(env, probe) gain on the measured-branch accumulated penetration. Force and torque computed from
-        # these accumulators downstream scale linearly with gain because they're proportional to ``sum_p``.
+        # Penetration-weighted average of the spin rate over contacts; the per-probe gain cancels in the ratio, so
+        # this uses the pre-gain accumulators.
+        omega_n_gt = gs.qd_float(0.0)
+        if sum_p_gt > eps:
+            omega_n_gt = omega_w_gt / sum_p_gt
+        omega_n_m = gs.qd_float(0.0)
+        if sum_p_m > eps:
+            omega_n_m = omega_w_m / sum_p_m
+
+        # Apply the per-(env, probe) gain to the measured accumulators; force is linear in them, so this scales it.
         gain_m = probe_gains[i_b, i_p]
         sum_p_m = sum_p_m * gain_m
         for j in qd.static(range(3)):
             fv_m[j] = fv_m[j] * gain_m
-            tau_w_m[j] = tau_w_m[j] * gain_m
 
         taxel_signal_buf[i_p, i_b] = sum_p_m
 
-        f_w_gt = qd.Vector.zero(gs.qd_float, 3)
+        # Lever arm from the sensor link origin to the taxel, in world frame.
+        lever_world = probe_world - s_pos
+
+        force_world_gt = qd.Vector.zero(gs.qd_float, 3)
         for j in qd.static(range(3)):
-            f_w_gt[j] = k_stiff * dens * sum_p_gt * a_w[j]
+            force_world_gt[j] = k_stiff * dens * sum_p_gt * a_w[j]
         if k_shear > eps:
             for j in qd.static(range(3)):
-                f_w_gt[j] = f_w_gt[j] + k_shear * dens * fv_gt[j]
+                force_world_gt[j] = force_world_gt[j] + k_shear * dens * fv_gt[j]
 
-        tau_scaled_gt = qd.Vector.zero(gs.qd_float, 3)
+        # Torque is the moment of the full force about the sensor link origin, minus a spin term along the normal
+        # driven by the relative twist rate.
+        torque_world_gt = lever_world.cross(force_world_gt)
         for j in qd.static(range(3)):
-            tau_scaled_gt[j] = k_stiff * dens * tau_w_gt[j]
+            torque_world_gt[j] = torque_world_gt[j] - a_w[j] * (k_twist * omega_n_gt)
 
-        f_l_gt = gu.qd_inv_transform_by_quat(f_w_gt, s_quat)
-        t_l_gt = gu.qd_inv_transform_by_quat(tau_scaled_gt, s_quat)
+        force_link_gt = gu.qd_inv_transform_by_quat(force_world_gt, s_quat)
+        torque_link_gt = gu.qd_inv_transform_by_quat(torque_world_gt, s_quat)
 
-        f_w_m = qd.Vector.zero(gs.qd_float, 3)
+        force_world_measured = qd.Vector.zero(gs.qd_float, 3)
         for j in qd.static(range(3)):
-            f_w_m[j] = k_stiff * dens * sum_p_m * a_w[j]
+            force_world_measured[j] = k_stiff * dens * sum_p_m * a_w[j]
         if k_shear > eps:
             for j in qd.static(range(3)):
-                f_w_m[j] = f_w_m[j] + k_shear * dens * fv_m[j]
+                force_world_measured[j] = force_world_measured[j] + k_shear * dens * fv_m[j]
 
-        tau_scaled_m = qd.Vector.zero(gs.qd_float, 3)
+        torque_world_measured = lever_world.cross(force_world_measured)
         for j in qd.static(range(3)):
-            tau_scaled_m[j] = k_stiff * dens * tau_w_m[j]
+            torque_world_measured[j] = torque_world_measured[j] - a_w[j] * (k_twist * omega_n_m)
 
-        f_l_m = gu.qd_inv_transform_by_quat(f_w_m, s_quat)
-        t_l_m = gu.qd_inv_transform_by_quat(tau_scaled_m, s_quat)
+        force_link_measured = gu.qd_inv_transform_by_quat(force_world_measured, s_quat)
+        torque_link_measured = gu.qd_inv_transform_by_quat(torque_world_measured, s_quat)
 
         force_start = cache_start + _i_p * 3
         torque_start = cache_start + n_probes * 3 + _i_p * 3
         for j in qd.static(range(3)):
-            output_gt[force_start + j, i_b] = f_l_gt[j]
+            output_gt[force_start + j, i_b] = force_link_gt[j]
         for j in qd.static(range(3)):
-            output_gt[torque_start + j, i_b] = t_l_gt[j]
+            output_gt[torque_start + j, i_b] = torque_link_gt[j]
         for j in qd.static(range(3)):
-            output_measured[force_start + j, i_b] = f_l_m[j]
+            output_measured[force_start + j, i_b] = force_link_measured[j]
         for j in qd.static(range(3)):
-            output_measured[torque_start + j, i_b] = t_l_m[j]
+            output_measured[torque_start + j, i_b] = torque_link_measured[j]
 
 
 @dataclass
@@ -678,6 +693,7 @@ class ProximityTaxelMetadata(
 ):
     stiffness: torch.Tensor = make_tensor_field((0,))
     shear_coupling: torch.Tensor = make_tensor_field((0,))
+    twist_scalar: torch.Tensor = make_tensor_field((0,))
     proximity_density_scale: torch.Tensor = make_tensor_field((0, 0))
     taxel_signal_buf: torch.Tensor = make_tensor_field((0, 0))
 
@@ -711,6 +727,9 @@ class ProximityTaxelSensor(
         )
         self._shared_metadata.shear_coupling = concat_with_tensor(
             self._shared_metadata.shear_coupling, float(self._options.shear_coupling), expand=(1,)
+        )
+        self._shared_metadata.twist_scalar = concat_with_tensor(
+            self._shared_metadata.twist_scalar, float(self._options.twist_scalar), expand=(1,)
         )
         pc_start = self._shared_metadata.sensor_pc_start[-1].item()
         pc_end = pc_start + self._shared_metadata.sensor_pc_n[-1].item()
@@ -769,6 +788,7 @@ class ProximityTaxelSensor(
             shared_metadata.probe_gains,
             shared_metadata.stiffness,
             shared_metadata.shear_coupling,
+            shared_metadata.twist_scalar,
             shared_metadata.proximity_density_scale,
             current_ground_truth_data_T,
             measured_cols_b,
@@ -1047,6 +1067,7 @@ def _dilate_kernel_builder(meta_entry: GridFFTMeta, fft_n: tuple[int, int]) -> t
 
 @qd.func
 def _func_elastomer_min_signed_dist_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_world: qd.types.vector(3),
@@ -1081,14 +1102,14 @@ def _func_elastomer_min_signed_dist_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_world, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not track_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -1121,6 +1142,8 @@ def _func_elastomer_min_signed_dist_bvh(
 def _kernel_elastomer_probe_depth_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
     probe_radii: qd.types.ndarray(),
     track_geom_mask: qd.types.ndarray(),
@@ -1156,12 +1179,22 @@ def _kernel_elastomer_probe_depth_bvh(
         probe_world = link_pos + gu.qd_transform_by_quat(probe_local, link_quat)
 
         signed = _func_elastomer_min_signed_dist_bvh(
-            i_b, i_s, probe_world, bvh_nodes_a, bvh_morton_codes_a, track_geom_mask, dyn_state, dyn_info, max_query_dist
+            env_bvh_idx_a[i_b],
+            i_b,
+            i_s,
+            probe_world,
+            bvh_nodes_a,
+            bvh_morton_codes_a,
+            track_geom_mask,
+            dyn_state,
+            dyn_info,
+            max_query_dist,
         )
         if is_split:
             # The collision faces are partitioned over two trees (see RaycastContext.activate); |signed| is the
             # distance the query minimizes, so the smaller magnitude is the globally nearest triangle's answer.
             signed_b = _func_elastomer_min_signed_dist_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_world,
@@ -1463,6 +1496,8 @@ def _kernel_elastomer_surface_state_bvh(
 @qd.kernel(fastcache=False)
 def _kernel_elastomer_surface_state_via_global_bvh(
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_elastomer_geom_start: qd.types.ndarray(),
     elastomer_geom_idx: qd.types.ndarray(),
     bvh_chunk_sensor_idx: qd.types.ndarray(),
@@ -1584,6 +1619,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                         surface_pos_sensor_buf[i_b, i_o, k] = point_sensor[k]
 
                     min_sdf = _func_elastomer_min_signed_dist_bvh(
+                        env_bvh_idx_a[i_b],
                         i_b,
                         i_s,
                         point_world,
@@ -1597,6 +1633,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                     if is_split:
                         # See _kernel_elastomer_probe_depth_bvh for the two-tree fold.
                         min_sdf_b = _func_elastomer_min_signed_dist_bvh(
+                            env_bvh_idx_b[i_b],
                             i_b,
                             i_s,
                             point_world,
@@ -2224,6 +2261,8 @@ class ElastomerTaxelSensor(
             _kernel_elastomer_probe_depth_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.probe_positions,
                 shared_metadata.probe_radii,
                 shared_metadata.sensor_candidate_geom_mask,
@@ -2302,6 +2341,8 @@ class ElastomerTaxelSensor(
                 entry_a, entry_b = collision_bvh_contexts[0], collision_bvh_contexts[-1]
                 _kernel_elastomer_surface_state_via_global_bvh(
                     shared_metadata.links_idx,
+                    entry_a.env_bvh_idx,
+                    entry_b.env_bvh_idx,
                     shared_metadata.sensor_elastomer_geom_start,
                     shared_metadata.elastomer_geom_idx,
                     bvh.chunk_sensor_idx,

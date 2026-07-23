@@ -100,6 +100,7 @@ SKIP_NO_MADRONA = _skip_reason("BatchRenderer is not supported because 'gs_madro
 SKIP_NO_LUISA = _skip_reason("RayTracer is not supported because 'LuisaRenderPy' is not available.")
 SKIP_NO_VIEWER = _skip_reason("Interactive viewer not supported on this platform.")
 SKIP_NO_OMNIVERSE_KIT = _skip_reason("omniverse-kit support not available")
+SKIP_METAL_GRAD = _skip_reason("Apple Metal GPU computes wrong reverse-mode gradients (Quadrants backward bug).")
 
 
 def is_mem_monitoring_supported():
@@ -175,6 +176,16 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
     # Force disabling forked for non-linux systems
     if not sys.platform.startswith("linux"):
         config.option.forked = False
+
+    # Snapshot regeneration must run serially: syrupy writes updated snapshots at session end in the main process, so
+    # it is incompatible with xdist and pytest-forked. Coerce the default '-n auto' to serial like the viewer does,
+    # but reject an explicitly parallel or forked run.
+    if config.getoption("--snapshot-update", False):
+        if config.option.forked or (isinstance(config.option.numprocesses, int) and config.option.numprocesses > 0):
+            raise pytest.UsageError(
+                "'--snapshot-update' requires serial execution; run with '-n 0' and without '--forked'."
+            )
+        config.option.numprocesses = 0
 
     # Force disabling distributed framework if interactive viewer is enabled
     show_viewer = config.getoption("--vis", IS_INTERACTIVE_VIEWER_AVAILABLE)
@@ -573,6 +584,8 @@ def precision(request, backend):
         # Only default to 64bits precision when running the unit tests on CPU backend
         expr = Expression.compile(request.config.option.markexpr)
         is_benchmarks = expr.evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
+        if isinstance(backend, str):
+            backend = getattr(gs.constants.backend, backend)
         precision = "64" if not is_benchmarks and backend == gs.cpu else "32"
     return precision
 

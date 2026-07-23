@@ -9,7 +9,7 @@ import os
 import random
 import sys
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import field
 from importlib import import_module
 from itertools import combinations
@@ -24,6 +24,7 @@ import torch
 
 
 import genesis as gs
+from genesis.typing import is_sequence
 
 
 LOGGER = logging.getLogger(__name__)
@@ -412,6 +413,19 @@ def tensor_to_array(x: torch.Tensor, dtype: type[np.generic] | None = None) -> n
     return np.asarray(tensor_to_cpu(x), dtype=dtype)
 
 
+def data_to_array(data):
+    """Recursively move any GPU tensor nested in ``data`` to a CPU numpy array, preserving container structure."""
+    if isinstance(data, torch.Tensor):
+        return tensor_to_array(data)
+    if isinstance(data, np.ndarray):
+        return data
+    if isinstance(data, Mapping):
+        return {k: data_to_array(v) for k, v in data.items()}
+    if is_sequence(data):
+        return type(data)(data_to_array(v) for v in data)
+    return data
+
+
 def is_approx_multiple(a, b, tol=1e-7):
     return abs(a % b) < tol or abs(b - (a % b)) < tol
 
@@ -702,7 +716,7 @@ def qd_to_torch(
         except AttributeError:
             try:
                 tc = value.to_torch(copy=False)
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError, TypeError):
                 if copy is False:
                     raise
                 tensor = _maybe_transpose(value.to_torch(), value, transpose)
@@ -793,8 +807,10 @@ def qd_zero_grad(value) -> None:
 
     Reverse-mode accumulation in Genesis writes through `qd.atomic_add`, so adjoint buffers must start at zero between
     consecutive `loss.backward()` calls. Solvers call this from `reset_grad` to clear all owned adjoint storage without
-    enumerating fields by name. Zeroing goes through `qd_to_torch(grad, copy=False).zero_()`, a contiguous in-place
-    memset on the underlying device memory - no Quadrants kernel launch.
+    enumerating fields by name. Zeroing goes through an in-place `zero_()` on the zero-copy torch view of each grad
+    buffer, a contiguous memset on the underlying device memory. The writes are left unsynchronized so a caller can
+    batch many calls under a single flush: on Metal, call `torch.mps.synchronize()` after the batch and before the
+    next quadrants kernel reads the buffers (see set_base_links_quat).
     """
     if value is None:
         return
@@ -804,10 +820,12 @@ def qd_zero_grad(value) -> None:
             grad = value.grad
             if gs.use_zerocopy:
                 try:
-                    qd_to_torch(grad, copy=False).zero_()
+                    grad_view = qd_to_torch(grad, copy=False)
+                    grad_view.zero_()
                 except ValueError:
-                    # No zero-copy view for this buffer (e.g. a field past 2**31 bytes in its SNode tree); fill it in
-                    # place through quadrants instead.
+                    # No zero-copy view for this buffer (e.g. an interleaved AOS struct member, or a field whose
+                    # in-tree byte offset the installed torch cannot carry through DLPack); fill it in place through
+                    # quadrants instead.
                     grad.fill(0.0)
             else:
                 grad.fill(0.0)

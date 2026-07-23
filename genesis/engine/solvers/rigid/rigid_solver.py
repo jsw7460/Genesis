@@ -32,6 +32,14 @@ from ..base_solver import MutatedLinks, Solver, StateChange, mutates
 from ..kinematic_solver import KinematicSolver, _select_links_offset, _offset_world_shift, _fill_base_link_geom_offsets
 from .collider import Collider
 from .constraint import ConstraintSolver
+from .constraint.backward import (
+    kernel_manual_add_collision_constraints_bw,
+    kernel_manual_add_frictionloss_constraints_bw,
+    kernel_manual_add_equality_constraints_bw,
+    kernel_accumulate_constraint_solver_grads,
+    kernel_load_dL_dqacc_from_acc_grad,
+    kernel_manual_add_joint_limit_constraints_bw,
+)
 from .abd.misc import (
     func_add_safe_backward,
     func_apply_coupling_force,
@@ -94,7 +102,10 @@ from .abd.forward_kinematics import (
     kernel_update_all_verts,
     kernel_update_geom_aabbs,
     kernel_update_vgeoms,
+    kernel_COM_links_replay,
     kernel_update_cartesian_space,
+    kernel_forward_kinematics_replay,
+    kernel_update_geoms_replay,
 )
 from .abd.forward_dynamics import (
     func_actuation,
@@ -115,7 +126,6 @@ from .abd.forward_dynamics import (
     kernel_compute_mass_matrix,
     kernel_forward_dynamics,
     kernel_update_acc,
-    kernel_compute_qacc,
     kernel_forward_dynamics_without_qacc,
     update_qacc_from_qvel_delta,
     update_qvel,
@@ -179,6 +189,12 @@ from .abd.diff import (
     kernel_prepare_backward_substep,
     kernel_begin_backward_substep,
     kernel_copy_acc,
+    kernel_copy_next_to_curr_no_check,
+)
+from .abd.manual_bw import (
+    kernel_manual_compute_qacc_bw,
+    kernel_manual_forward_kinematics_bw,
+    kernel_manual_forward_velocity_bw,
 )
 
 if TYPE_CHECKING:
@@ -719,8 +735,10 @@ class RigidSolver(KinematicSolver):
                     f"{type(self.sim.coupler).__name__} is not supported yet when requires_grad is True."
                 )
 
-            if getattr(self._options, "noslip_iterations", 0) > 0:
+            if self._options.noslip_iterations > 0:
                 gs.raise_exception("Noslip is not supported yet when requires_grad is True.")
+            if self._options.enable_torsional_friction or self._options.enable_rolling_friction:
+                gs.raise_exception("Torsional and rolling friction are not supported yet when requires_grad is True.")
 
     def _create_data_manager(self):
         # We initialize data even if the solver is not active because the coupler needs arguments like
@@ -1231,7 +1249,7 @@ class RigidSolver(KinematicSolver):
         )
 
         if isinstance(self.sim.coupler, SAPCoupler):
-            update_qvel(self.dyn_state, self.rigid_info, self.rigid_config, self._is_backward)
+            update_qvel(self.dyn_state, self.rigid_info, self.rigid_config)
         else:
             self._func_constraint_force()
             kernel_step_2(
@@ -1323,6 +1341,75 @@ class RigidSolver(KinematicSolver):
         if not self._disable_constraint:
             self.constraint_solver.add_inequality_constraints()
             self.constraint_solver.resolve()
+
+    def _constraint_force_grad(self):
+        """Backward pass for the constraint solver: seed dL_dqacc from acc.grad, run the adjoint solve, fold its
+        outputs back into the autodiff grad fields, then reverse the constraint-row assembly."""
+        constraint_state = self.constraint_solver.constraint_state
+        # Pure grad shuffles: in-place through zero-copy views when supported, kernel dispatch otherwise (see
+        # "Pure read-write data accessors on the hot path" in CLAUDE.md). gs.use_zerocopy encodes every zero-copy
+        # availability condition for these buffers (standalone dense allocations with DLPack-supported dtypes; the
+        # platform gates live in gs.init). torch (MPS) and quadrants do not share a compute stream on Metal, so the
+        # writes are flushed before the next kernels (see set_base_links_quat).
+        if gs.use_zerocopy:
+            acc_grad = qd_to_torch(self.dyn_state.dofs.acc.grad, copy=False)
+            dL_dqacc = qd_to_torch(constraint_state.dL_dqacc, copy=False)
+            dL_dqacc.copy_(acc_grad)
+            acc_grad.zero_()
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+        else:
+            kernel_load_dL_dqacc_from_acc_grad(self.dyn_state, constraint_state, self.rigid_config)
+        self.constraint_solver.backward()
+        if gs.use_zerocopy:
+            force_grad = qd_to_torch(self.dyn_state.dofs.force.grad, copy=False)
+            dL_dforce = qd_to_torch(constraint_state.dL_dforce, copy=False)
+            force_grad.add_(dL_dforce)
+            mass_mat_grad = qd_to_torch(self.rigid_info.mass_mat.grad, copy=False)
+            dL_dM = qd_to_torch(constraint_state.dL_dM, copy=False)
+            mass_mat_grad.add_(dL_dM)
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
+        else:
+            kernel_accumulate_constraint_solver_grads(
+                self.dyn_state, constraint_state, self.rigid_info, self.rigid_config
+            )
+
+        kernel_manual_add_equality_constraints_bw(
+            self.dyn_state, constraint_state, self.dyn_info, self.rigid_info, self.rigid_config
+        )
+        kernel_manual_add_frictionloss_constraints_bw(
+            self.dyn_state, constraint_state, self.dyn_info, self.rigid_info, self.rigid_config
+        )
+
+        if self._enable_collision:
+            collider_state = self.collider._collider_state
+            qd_zero_grad(collider_state.contact_data.pos)
+            qd_zero_grad(collider_state.contact_data.normal)
+            qd_zero_grad(collider_state.contact_data.penetration)
+            # One flush for the zeroing batch; see qd_zero_grad in misc.py.
+            if gs.use_zerocopy and gs.backend == gs.metal:
+                torch.mps.synchronize()
+            kernel_manual_add_collision_constraints_bw(
+                self.dyn_state,
+                collider_state,
+                constraint_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
+            )
+            self.collider.backward_narrowphase()
+
+        if self._enable_joint_limit:
+            kernel_manual_add_joint_limit_constraints_bw(
+                self.dyn_state,
+                self.collider._collider_state,
+                constraint_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
+                enable_collision=self._enable_collision,
+            )
 
     def _func_forward_dynamics(self):
         kernel_forward_dynamics(
@@ -1481,6 +1568,38 @@ class RigidSolver(KinematicSolver):
             qd_zero_grad(self.dyn_state_adjoint_cache.joints)
             qd_zero_grad(self.dyn_state_adjoint_cache.geoms)
             qd_zero_grad(self._rigid_adjoint_cache)
+            # One flush for the zeroing batch; see qd_zero_grad in misc.py.
+            if gs.use_zerocopy and gs.backend == gs.metal:
+                torch.mps.synchronize()
+
+    def _update_cartesian_grad(self, envs_idx):
+        """Forward-replay the post-integrate cartesian-space update (FK -> COM -> geom poses -> velocity) under
+        is_backward=True, then reverse it stage by stage.
+
+        Velocity and forward kinematics are reversed manually (kernel_manual_*_bw in manual_bw.py), while COM and
+        the link->geom transform are reversed by Quadrants autodiff (.grad). Shared by the post-integrate reverse
+        and the first-substep initial-state reverse in substep_pre_coupling_grad.
+        """
+        # Forward replay in dependency order (FK -> COM -> geoms -> velocity).
+        kernel_forward_kinematics_replay(
+            envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
+        )
+        kernel_COM_links_replay(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
+        kernel_update_geoms_replay(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
+        kernel_forward_velocity(
+            envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
+        )
+
+        # Reverse the stages: velocity first, forward kinematics last. COM and geoms both consume only FK
+        # outputs, so their mutual order is free.
+        kernel_manual_forward_velocity_bw(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
+        kernel_COM_links_replay.grad(
+            self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
+        )
+        kernel_update_geoms_replay.grad(
+            self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
+        )
+        kernel_manual_forward_kinematics_bw(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
 
     def substep_pre_coupling_grad(self, f):
         # Change to backward mode
@@ -1498,21 +1617,13 @@ class RigidSolver(KinematicSolver):
             self.rigid_config,
         )
         self.substep(f)
-
         # =================== Backward substep ======================
         envs_idx = self._scene._sanitize_envs_idx(None)
         if not self._enable_mujoco_compatibility:
-            kernel_forward_velocity.grad(
-                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
-            )
-            kernel_update_cartesian_space.grad(
-                self.dyn_state,
-                self.dyn_info,
-                self.rigid_info,
-                self.rigid_config,
-                force_update_fixed_geoms=False,
-                is_backward=True,
-            )
+            # The FK backward below builds its Jacobian at the post-integrate qpos / vel, so copy the integrator's
+            # _next outputs into the current slots first.
+            kernel_copy_next_to_curr_no_check(self.dyn_state, self.rigid_info, self.rigid_config)
+            self._update_cartesian_grad(envs_idx)
 
         is_grad_valid = kernel_begin_backward_substep(
             f,
@@ -1537,16 +1648,15 @@ class RigidSolver(KinematicSolver):
             errno=self._errno,
         )
 
-        # We cannot use [kernel_forward_dynamics.grad] because we read [dofs_state.acc] and overwrite it in the kernel,
-        # which is prohibited (https://docs.taichi-lang.org/docs/differentiable_programming#global-data-access-rules).
-        # In [kernel_forward_dynamics], we read [acc] in [func_update_acc] and overwrite it in [kernel_compute_qacc].
-        # As [kenrel_compute_qacc] is called at the end of [kernel_forward_dynamics], we first backpropagate through
-        # [kernel_compute_qacc] and then restore the original [acc] from the adjoint cache. This copy operation
-        # cannot be merged with [kernel_compute_qacc.grad] because .grad function itself is a standalone kernel.
-        # We could possibly merge this small kernel later if (1) .grad function is regarded as a function instead of a
-        # kernel, (2) we add another variable to store the new [acc] from [kernel_compute_qacc] and thus can avoid
-        # the data access violation. However, both of these require major changes.
-        kernel_compute_qacc.grad(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True)
+        # Mirror the forward branch in _func_constraint_force:
+        #   (A) _disable_constraint=True: the forward never calls the constraint solver; acc is the smooth-dynamics
+        #       result. Reverse via kernel_manual_compute_qacc_bw (implicit function theorem through M).
+        #   (B) _disable_constraint=False: the forward always calls constraint_solver.resolve. Reverse via
+        #       _constraint_force_grad.
+        if not self._disable_constraint:
+            self._constraint_force_grad()
+        else:
+            kernel_manual_compute_qacc_bw(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
         kernel_copy_acc(f, self.dyn_state, self._rigid_adjoint_cache, self.rigid_config)
 
         kernel_forward_dynamics_without_qacc.grad(
@@ -1560,17 +1670,7 @@ class RigidSolver(KinematicSolver):
 
         # If it was the very first substep, we need to backpropagate through the initial update of the cartesian space
         if self._enable_mujoco_compatibility or self._sim.cur_substep_global == 0:
-            kernel_forward_velocity.grad(
-                envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=True
-            )
-            kernel_update_cartesian_space.grad(
-                self.dyn_state,
-                self.dyn_info,
-                self.rigid_info,
-                self.rigid_config,
-                force_update_fixed_geoms=False,
-                is_backward=True,
-            )
+            self._update_cartesian_grad(envs_idx)
 
         # Change back to forward mode
         self._is_backward = False
@@ -1582,7 +1682,7 @@ class RigidSolver(KinematicSolver):
             return
 
         if isinstance(self.sim.coupler, SAPCoupler):
-            update_qacc_from_qvel_delta(self.dyn_state, self.rigid_info, self.rigid_config, self._is_backward)
+            update_qacc_from_qvel_delta(self.dyn_state, self.rigid_info, self.rigid_config)
             kernel_step_2(
                 self.dyn_state,
                 self.collider._collider_state,
@@ -1821,9 +1921,11 @@ class RigidSolver(KinematicSolver):
             if ckpt_name not in self._ckpt:
                 self._ckpt[ckpt_name] = dict()
 
-            self._ckpt[ckpt_name]["qpos"] = qd_to_numpy(self._rigid_adjoint_cache.qpos)
-            self._ckpt[ckpt_name]["dofs_vel"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_vel)
-            self._ckpt[ckpt_name]["dofs_acc"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_acc)
+            # copy=True required: with the zerocopy backend qd_to_numpy returns a view, so later substeps would
+            # overwrite this ckpt's buffer in place.
+            self._ckpt[ckpt_name]["qpos"] = qd_to_numpy(self._rigid_adjoint_cache.qpos, copy=True)
+            self._ckpt[ckpt_name]["dofs_vel"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_vel, copy=True)
+            self._ckpt[ckpt_name]["dofs_acc"] = qd_to_numpy(self._rigid_adjoint_cache.dofs_acc, copy=True)
 
             for entity in self._entities:
                 entity.save_ckpt(ckpt_name)
@@ -1835,12 +1937,24 @@ class RigidSolver(KinematicSolver):
         self.dyn_state.dofs.acc.from_numpy(self._ckpt[ckpt_name]["dofs_acc"][0])
 
         if not self._enable_mujoco_compatibility:
+            # Mirror the post-integrate refresh of kernel_step_2: the replayed substeps skip their own cartesian /
+            # velocity updates (is_forward_pos_updated / is_forward_vel_updated), so both must be recomputed here
+            # from the restored qpos / vel. A stale link velocity would corrupt the velocity-product terms of every
+            # backward primal in the window.
             kernel_update_cartesian_space(
                 self.dyn_state,
                 self.dyn_info,
                 self.rigid_info,
                 self.rigid_config,
                 force_update_fixed_geoms=False,
+                is_backward=False,
+            )
+            kernel_forward_velocity(
+                self._scene._sanitize_envs_idx(None),
+                self.dyn_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
                 is_backward=False,
             )
 
@@ -3122,7 +3236,7 @@ def kernel_step_2(
     func_update_acc(dyn_state, dyn_info, rigid_info, rigid_config, update_cacc=True, is_backward=is_backward)
 
     if qd.static(rigid_config.integrator != gs.integrator.approximate_implicitfast):
-        func_implicit_damping(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
+        func_implicit_damping(dyn_state, dyn_info, rigid_info, rigid_config)
 
     func_integrate(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
 
