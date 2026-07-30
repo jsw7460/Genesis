@@ -522,7 +522,7 @@ class ConstraintState:
     use_full_hessian: qd.Tensor
     # Solver loop iteration counter (0-indexed, increments each iteration in the graph loop)
     solver_iter_counter: qd.Tensor
-    # Always ndarray (not field): graph_do_while requires the same physical ndarray on every call.
+    # Always ndarray (not field): graph.do_while requires the same physical ndarray on every call.
     graph_counter: qd.types.ndarray()
     early_exit_flag: qd.Tensor
 
@@ -2397,6 +2397,10 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     batch_joints_info: bool
     enable_mujoco_compatibility: bool
     enable_elliptic_friction: bool
+    # Whether contact friction is bounded by the disc of radius mu * f_n taken from the normal force developed at the
+    # current iterate, instead of jointly with it through the coupled cone (see gs.contact_resolution). Implies
+    # enable_elliptic_friction: the pyramidal rows do not separate into a normal row and a friction disc.
+    enable_signorini_contact: bool
     enable_multi_contact: bool
     enable_joint_limit: bool
     box_box_detection: bool

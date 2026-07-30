@@ -164,7 +164,7 @@ def _func_decomp_linesearch_p0(
                             for i_r in qd.static(range(n_rows)):
                                 rows_jv[i_r] = constraint_state.jv[i_c + i_r, i_b]
                             _c_cost, c_grad, c_hess = solver._func_cone_cost_along_alpha(
-                                rows_jaref, rows_jv, 0.0, rows_efc_D, con_mu, rows_friction
+                                rows_jaref, rows_jv, 0.0, rows_efc_D, con_mu, rows_friction, rigid_config
                             )
                             local_constraint_grad += c_grad
                             local_constraint_hess += 0.5 * c_hess
@@ -754,7 +754,7 @@ def _kernel_solve_graph(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
-    while qd.graph_do_while(graph_counter):
+    while qd.graph.do_while(graph_counter):
         # Fused: mv + jv + snorm + quad_gauss + eq_sum
         _func_decomp_linesearch_p0(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
         # Fused: refinement + apply alpha
@@ -841,7 +841,7 @@ def _kernel_solve_graph(
 )
 def func_solve_decomposed(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, _n_iterations):
     """
-    GPU graph accelerated solver loop with parallel grid-search linesearch and GPU-side iteration via graph_do_while.
+    GPU graph accelerated solver loop with parallel grid-search linesearch and GPU-side iteration via graph.do_while.
 
     On CUDA SM 9.0+ (Hopper), the entire iteration loop runs on the GPU with no host involvement. On older CUDA GPUs,
     falls back to a host-side do-while loop that still benefits from CUDA graph kernel launch batching. On other GPUs,

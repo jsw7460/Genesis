@@ -293,6 +293,29 @@ class RigidSolver(KinematicSolver):
         if options.friction_cone == gs.friction_cone.elliptic and self._requires_grad:
             gs.raise_exception("The elliptic friction cone is not supported yet when 'requires_grad' is True.")
 
+        # Bounding friction against the developed normal force needs the contact to split into a normal row and a
+        # friction disc, which only the elliptic cone provides. MuJoCo compatibility keeps the coupled cone regardless,
+        # since letting sliding inflate the normal force is part of the behaviour being reproduced. The disc radius is
+        # relatched every iteration, making the solve a successive approximation whose objective moves underneath the
+        # solver; only Newton re-derives its curvature each iteration and lands on the fixed point, while conjugate
+        # gradient carries a search history that the moving objective invalidates, leaving friction short.
+        signorini_blocker = ""
+        if self._enable_mujoco_compatibility:
+            signorini_blocker = "'enable_mujoco_compatibility' is True"
+        elif options.friction_cone != gs.friction_cone.elliptic:
+            signorini_blocker = "it requires 'friction_cone' to be 'gs.friction_cone.elliptic'"
+        elif options.constraint_solver != gs.constraint_solver.Newton:
+            signorini_blocker = "it requires 'constraint_solver' to be 'gs.constraint_solver.Newton'"
+        if options.contact_resolution is None:
+            options.contact_resolution = (
+                gs.contact_resolution.convex if signorini_blocker else gs.contact_resolution.signorini
+            )
+        elif options.contact_resolution == gs.contact_resolution.signorini and signorini_blocker:
+            gs.raise_exception(
+                f"'contact_resolution' cannot be 'gs.contact_resolution.signorini' when {signorini_blocker}."
+            )
+        self._contact_resolution = options.contact_resolution
+
         # A high tangential-to-normal impedance ratio suppresses the tangential creep of regularized friction that
         # lets resting structures slowly slide apart under their own weight. With the elliptic cone the tangential
         # rows are stiffened independently, so it resolves to a high ratio - except under MuJoCo compatibility, where
@@ -556,6 +579,7 @@ class RigidSolver(KinematicSolver):
             batch_joints_info=self._options.batch_joints_info,
             enable_mujoco_compatibility=self._enable_mujoco_compatibility,
             enable_elliptic_friction=self._options.friction_cone == gs.friction_cone.elliptic,
+            enable_signorini_contact=self._contact_resolution == gs.contact_resolution.signorini,
             enable_torsional_friction=self._options.enable_torsional_friction,
             enable_rolling_friction=self._options.enable_rolling_friction,
             enable_multi_contact=self._enable_multi_contact,
@@ -1218,6 +1242,20 @@ class RigidSolver(KinematicSolver):
     def _init_constraint_solver(self):
         # Islands are a per-island Newton solve inside ConstraintSolver.resolve, gated on use_contact_island.
         self.constraint_solver = ConstraintSolver(self)
+
+    def update_forward_pos(self):
+        """Run forward kinematics over links and geoms if they are not already up to date for the current pose.
+
+        Geoms are refreshed alongside links, unlike the geom-less base solver: the flag this sets also authorizes the
+        next step to skip its own Cartesian-space update, which covers geoms too. Refreshing links alone would leave
+        collision - and any raycast deriving its vertices from geom poses - reading a one-step-stale pose.
+        """
+        if self._is_forward_pos_updated:
+            return
+        kernel_forward_kinematics_links_geoms(
+            self.scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+        )
+        self._is_forward_pos_updated = True
 
     def substep(self, f):
         # from genesis.utils.tools import create_timer
@@ -2802,13 +2840,13 @@ class RigidSolver(KinematicSolver):
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_inertial_mass(self, links_idx=None, envs_idx=None):
-        if self._options.batch_links_info and envs_idx is not None:
+        if not self._options.batch_links_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
         tensor = qd_to_torch(self.dyn_info.links.inertial_mass, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
 
     def get_links_invweight(self, links_idx=None, envs_idx=None):
-        if self._options.batch_links_info and envs_idx is not None:
+        if not self._options.batch_links_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
         tensor = qd_to_torch(self.dyn_info.links.invweight, envs_idx, links_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 and self._options.batch_links_info else tensor
@@ -2986,13 +3024,96 @@ class RigidSolver(KinematicSolver):
 
         return tensor
 
+    def get_kinetic_energy(self, links_idx=None, dofs_idx=None, envs_idx=None):
+        """Get the kinetic energy of the specified links and DOFs in Joules [J] (translational + rotational).
+
+        Summed over the links, each contributing ``0.5 * V^T * I * V`` for its spatial velocity ``V`` and spatial
+        inertia ``I`` about the center of mass (COM) of its kinematic tree, plus the motor armature contribution
+        ``0.5 * sum_d(armature_d * dq_d^2)`` of the DOFs. This equals the joint-space form ``0.5 * dq^T * M(q) * dq``
+        while reading the link velocities and inertias that forward kinematics already maintains, so it needs no mass
+        matrix and stays consistent with the current configuration whatever the integrator.
+
+        A link and the DOFs driving it contribute independently, so selecting one without the other is meaningful only
+        to isolate that one term.
+
+        Parameters
+        ----------
+        links_idx : None | array_like, optional
+            The indices of the links. If None, all links will be considered. Defaults to None.
+        dofs_idx : None | array_like, optional
+            The indices of the degrees of freedom. If None, all of them will be considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        kinetic_energy : torch.Tensor, shape () or (n_envs,)
+        """
+        # Spatial velocity and inertia are both referenced to the tree COM, so the quadratic form expands as
+        # 0.5 * m * |v|^2 + v . (w x (m * c)) + 0.5 * w . (I * w), with `cinr_pos` holding the first moment m * c.
+        cd_ang = qd_to_torch(self.dyn_state.links.cd_ang, envs_idx, links_idx, transpose=True)
+        cd_vel = qd_to_torch(self.dyn_state.links.cd_vel, envs_idx, links_idx, transpose=True)
+        cinr_inertial = qd_to_torch(self.dyn_state.links.cinr_inertial, envs_idx, links_idx, transpose=True)
+        cinr_pos = qd_to_torch(self.dyn_state.links.cinr_pos, envs_idx, links_idx, transpose=True)
+        cinr_mass = qd_to_torch(self.dyn_state.links.cinr_mass, envs_idx, links_idx, transpose=True)
+        translational = cinr_mass * torch.sum(cd_vel * cd_vel, dim=-1)
+        coupling = torch.sum(cd_vel * torch.cross(cd_ang, cinr_pos, dim=-1), dim=-1)
+        rotational = torch.sum(cd_ang * torch.matmul(cinr_inertial, cd_ang.unsqueeze(-1)).squeeze(-1), dim=-1)
+        kinetic_energy = torch.sum(0.5 * (translational + rotational) + coupling, dim=-1)
+
+        dofs_vel = qd_to_torch(self.dyn_state.dofs.vel, envs_idx, dofs_idx, transpose=True)
+        armature = self.get_dofs_armature(dofs_idx, envs_idx if self._options.batch_dofs_info else None)
+        kinetic_energy += 0.5 * torch.sum(armature * dofs_vel * dofs_vel, dim=-1)
+
+        return kinetic_energy[0] if self.n_envs == 0 else kinetic_energy
+
+    def get_potential_energy(self, links_idx=None, dofs_idx=None, envs_idx=None):
+        """Get the potential energy of the specified links and DOFs in Joules [J] (gravitational + joint springs).
+
+        Gravity contributes ``-sum_i(m_i * g^T * p_i)`` over the links, where ``p_i`` is the center of mass (COM)
+        position of link *i*. Joint springs contribute ``0.5 * sum_d(stiffness_d * (q_d - q0_d)^2)``, the elastic
+        energy stored by holding each DOF away from its neutral position. Both are state functions, so their sum with
+        the kinetic energy is conserved by a passive, frictionless, contact-free model.
+
+        Contacts contribute nothing: they are resolved by the constraint solver, which stabilizes a penetration
+        rather than storing it as an elastic potential.
+
+        Parameters
+        ----------
+        links_idx : None | array_like, optional
+            The indices of the links. If None, all links will be considered. Defaults to None.
+        dofs_idx : None | array_like, optional
+            The indices of the degrees of freedom. If None, all of them will be considered. Defaults to None.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        potential_energy : torch.Tensor, shape () or (n_envs,)
+        """
+        gravity = self.get_gravity(envs_idx=envs_idx)  # (3,) or (n_envs, 3)
+        links_pos = self.get_links_pos(links_idx, envs_idx, ref="link_com")  # (..., n_links, 3)
+        # `get_links_inertial_mass` only accepts `envs_idx` when links info is batched, since all the environments
+        # share the very same link masses otherwise.
+        links_mass = self.get_links_inertial_mass(links_idx, envs_idx if self._options.batch_links_info else None)
+
+        # PE_i = m_i * g^T * p_i => PE = sum_i(m_i * (g . p_i))
+        # g is (..., 3), links_pos is (..., n_links, 3) -> broadcast g to (..., 1, 3)
+        g_dot_p = torch.sum(gravity.unsqueeze(-2) * links_pos, dim=-1)  # (..., n_links)
+        potential_energy = -torch.sum(links_mass * g_dot_p, dim=-1)
+
+        # `dofs.pos` holds the deflection `qpos - qpos0` that the spring force is proportional to, so the elastic
+        # energy integrates directly against it whatever the neutral configuration.
+        dofs_pos = qd_to_torch(self.dyn_state.dofs.pos, envs_idx, dofs_idx, transpose=True)
+        stiffness = self.get_dofs_stiffness(dofs_idx, envs_idx if self._options.batch_dofs_info else None)
+        spring_energy = 0.5 * torch.sum(stiffness * dofs_pos * dofs_pos, dim=-1)
+        if self.n_envs == 0:
+            spring_energy = spring_energy[0]
+
+        return potential_energy + spring_energy
+
     def get_total_energy(self, envs_idx=None):
         """Get the total mechanical energy of all entities in Joules [J] (kinetic + potential).
-
-        Kinetic energy is computed using the joint-space mass matrix: ``KE = 0.5 * dq^T * M(q) * dq``. When the
-        ``approximate_implicitfast`` integrator is used, the mass matrix is recomputed once to exclude implicit
-        damping terms added during integration. Potential energy is the sum over all links:
-        ``PE = -sum_i(m_i * g^T * p_i)``, where ``p_i`` is the center-of-mass position of link *i*.
 
         Parameters
         ----------
@@ -3003,25 +3124,7 @@ class RigidSolver(KinematicSolver):
         -------
         total_energy : torch.Tensor, shape () or (n_envs,)
         """
-        if self.rigid_config.integrator == gs.integrator.approximate_implicitfast:
-            kernel_compute_mass_matrix(
-                self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, decompose=False
-            )
-        mass_mat = self.get_mass_mat(envs_idx=envs_idx)
-        dofs_vel = self.get_dofs_velocity(envs_idx=envs_idx)
-        Mv = torch.matmul(mass_mat, dofs_vel.unsqueeze(-1)).squeeze(-1)
-        kinetic_energy = 0.5 * torch.sum(dofs_vel * Mv, dim=-1)
-
-        gravity = self.get_gravity(envs_idx=envs_idx)  # (3,) or (n_envs, 3)
-        links_pos = self.get_links_pos(envs_idx=envs_idx, ref="link_com")  # (..., n_links, 3)
-        links_mass = self.get_links_inertial_mass(envs_idx=envs_idx)  # (n_links,), or (n_envs, n_links) if batched
-
-        # PE_i = m_i * g^T * p_i => PE = sum_i(m_i * (g . p_i))
-        # g is (..., 3), links_pos is (..., n_links, 3) -> broadcast g to (..., 1, 3)
-        g_dot_p = torch.sum(gravity.unsqueeze(-2) * links_pos, dim=-1)  # (..., n_links)
-        potential_energy = -torch.sum(links_mass * g_dot_p, dim=-1)
-
-        return kinetic_energy + potential_energy
+        return self.get_kinetic_energy(envs_idx=envs_idx) + self.get_potential_energy(envs_idx=envs_idx)
 
     def get_geoms_friction(self, geoms_idx=None):
         return qd_to_torch(self.dyn_info.geoms.friction, geoms_idx, copy=True)
