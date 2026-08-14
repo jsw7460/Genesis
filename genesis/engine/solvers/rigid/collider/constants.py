@@ -5,6 +5,19 @@ Constants and enums for the collider module.
 from enum import IntEnum
 
 
+class CCD_ALGORITHM_CODE(IntEnum):
+    """Convex collision detection algorithm codes."""
+
+    # Our MPR (with SDF)
+    MPR = 0
+    # MuJoCo MPR
+    MJ_MPR = 1
+    # Our GJK
+    GJK = 2
+    # MuJoCo GJK
+    MJ_GJK = 3
+
+
 class RETURN_CODE(IntEnum):
     """
     Return codes for the general subroutines used in GJK and EPA algorithms.
@@ -61,5 +74,4 @@ class EPA_POLY_INIT_RETURN_CODE(IntEnum):
     P3_INVALID_V5 = 5
     P3_MISSING_ORIGIN = 6
     P3_ORIGIN_ON_FACE = 7
-    P4_MISSING_ORIGIN = 8
     P4_FALLBACK3 = 9

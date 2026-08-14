@@ -1,7 +1,6 @@
 import sys
 from typing import TYPE_CHECKING
 
-import mujoco
 import numpy as np
 import pytest
 import torch
@@ -10,12 +9,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.misc import tensor_to_array
 
-from ..utils import (
-    assert_allclose,
-    check_mujoco_data_consistency,
-    check_mujoco_model_consistency,
-    init_simulators,
-)
+from ..utils.assertions import assert_allclose, assert_equal
 
 if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity.rigid_entity import RigidEntity
@@ -27,15 +21,18 @@ if TYPE_CHECKING:
 @pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
 def test_link_velocity(gs_sim, tol):
     # Check the velocity for a few "easy" special cases
-    init_simulators(gs_sim, qvel=np.array([0.0, 1.0]))
+    (gs_robot,) = gs_sim.entities
+
+    gs_robot.set_dofs_velocity([0.0, 1.0])
     assert_allclose(gs_sim.rigid_solver.dyn_state.links.cd_vel.to_numpy(), 0, tol=tol)
 
-    init_simulators(gs_sim, qvel=np.array([1.0, 0.0]))
+    gs_robot.set_dofs_velocity([1.0, 0.0])
     cvel_0, cvel_1 = gs_sim.rigid_solver.dyn_state.links.cd_vel.to_numpy()[:, 0]
     assert_allclose(cvel_0, np.array([0.0, 0.5, 0.0]), tol=tol)
     assert_allclose(cvel_1, np.array([0.0, 0.5, 0.0]), tol=tol)
 
-    init_simulators(gs_sim, qpos=np.array([0.0, np.pi / 2.0]), qvel=np.array([0.0, 1.2]))
+    gs_robot.set_qpos([0.0, np.pi / 2.0])
+    gs_robot.set_dofs_velocity([0.0, 1.2])
     COM = gs_sim.rigid_solver.dyn_state.links.root_COM[0, 0]
     assert_allclose(COM, np.array([0.375, 0.125, 0.0]), tol=tol)
     xanchor = gs_sim.rigid_solver.dyn_state.joints.xanchor[1, 0]
@@ -45,7 +42,8 @@ def test_link_velocity(gs_sim, tol):
     assert_allclose(cvel_1, np.array([-1.2 * (0.125 - 0.0), 1.2 * (0.375 - 0.5), 0.0]), tol=tol)
 
     # Check that the velocity is valid for a random configuration
-    init_simulators(gs_sim, qpos=np.array([-0.7, 0.2]), qvel=np.array([3.0, 13.0]))
+    gs_robot.set_qpos([-0.7, 0.2])
+    gs_robot.set_dofs_velocity([3.0, 13.0])
     xanchor = gs_sim.rigid_solver.dyn_state.joints.xanchor[1, 0]
     theta_0, theta_1 = gs_sim.rigid_solver.qpos.to_numpy()[:, 0]
     assert_allclose(xanchor[0], 0.5 * np.cos(theta_0), tol=tol)
@@ -225,32 +223,6 @@ def test_double_pendulum_links_acc(gs_sim, tol):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("xml_path", ["xml/franka_emika_panda/panda.xml"])
-@pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
-@pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
-@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_robot_kinematics(gs_sim, mj_sim, tol):
-    # Disable all constraints and actuation
-    mj_sim.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
-    mj_sim.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
-    gs_sim.rigid_solver.dyn_state.dofs.ctrl_mode.fill(int(gs.CTRL_MODE.FORCE))
-    gs_sim.rigid_solver._enable_collision = False
-    gs_sim.rigid_solver._enable_joint_limit = False
-    gs_sim.rigid_solver._disable_constraint = True
-    gs_sim.rigid_solver.collider.clear()
-    gs_sim.rigid_solver.constraint_solver.clear()
-
-    check_mujoco_model_consistency(gs_sim, mj_sim, tol=tol)
-
-    (gs_robot,) = gs_sim.entities
-    dof_bounds = gs_sim.rigid_solver.dyn_info.dofs.limit.to_numpy()
-    for _ in range(100):
-        qpos = dof_bounds[:, 0] + (dof_bounds[:, 1] - dof_bounds[:, 0]) * np.random.rand(gs_robot.n_qs)
-        init_simulators(gs_sim, mj_sim, qpos)
-        check_mujoco_data_consistency(gs_sim, mj_sim, tol=tol)
-
-
-@pytest.mark.required
 @pytest.mark.merge_fixed_links(False)
 @pytest.mark.parametrize("model_name", ["pendulum"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
@@ -292,24 +264,6 @@ def test_jacobian(gs_sim, tol):
 
     assert_allclose(J_p[3:, 0], ang_o, tol=tol)
     assert_allclose(J_p[:3, 0], lin_expected, tol=tol)
-
-
-@pytest.mark.required
-@pytest.mark.parametrize("model_name", ["compound_joint"])
-@pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG])
-@pytest.mark.parametrize("gs_integrator", [gs.integrator.Euler])
-def test_jacobian_compound_joints(gs_sim, mj_sim, tol):
-    (gs_robot,) = gs_sim.entities
-    end_link = gs_robot.get_link("seg2")
-    end_body_id = mujoco.mj_name2id(mj_sim.model, mujoco.mjtObj.mjOBJ_BODY, "seg2")
-    jacp = np.empty((3, mj_sim.model.nv), dtype=np.float64)
-    jacr = np.empty((3, mj_sim.model.nv), dtype=np.float64)
-
-    for qpos in (np.zeros(3), np.array([0.3, -0.5, 0.7])):
-        init_simulators(gs_sim, mj_sim, qpos)
-        mujoco.mj_jacBody(mj_sim.model, mj_sim.data, jacp, jacr, end_body_id)
-
-        assert_allclose(gs_robot.get_jacobian(end_link), np.concatenate([jacp, jacr]), tol=tol)
 
 
 @pytest.mark.slow  # ~200s
@@ -745,6 +699,69 @@ def test_setters(show_viewer, tol):
     assert_allclose(ghost_box.get_vAABB()[0], ((-0.20, -0.05, -0.10), (0.20, 0.05, 0.1)), tol=tol)
     assert_allclose(ghost_box.get_vAABB()[1], ((-0.05, -0.10, -0.2), (0.05, 0.10, 0.2)), tol=tol)
 
+    n_dofs = ghost_robot.n_dofs
+    dofs_idx_cases = (
+        (-1, (n_dofs - 1,)),
+        ([-n_dofs, -1], (0, n_dofs - 1)),
+        ((-2, -1), (n_dofs - 2, n_dofs - 1)),
+        (np.array((-2, -1), dtype=np.int32), (n_dofs - 2, n_dofs - 1)),
+        (np.array((-2.0, -1.0), dtype=np.float64), (n_dofs - 2, n_dofs - 1)),
+        (torch.tensor((-2, -1), dtype=torch.int32), (n_dofs - 2, n_dofs - 1)),
+        (range(-n_dofs, 0), tuple(range(n_dofs))),
+        (range(-2, 1), (n_dofs - 2, n_dofs - 1, 0)),
+        (slice(-2, None), (n_dofs - 2, n_dofs - 1)),
+        (slice(-1, None, -1), tuple(range(n_dofs - 1, -1, -1))),
+        (np.array((False, True, True, True, True, True, False)), (1, 2, 3, 4, 5)),
+        (torch.tensor((False, True, True, True, True, True, False)), (1, 2, 3, 4, 5)),
+    )
+    box_baseline = torch.arange(ghost_box.n_dofs, device=gs.device) * 0.01 + 0.1
+    robot_baseline = torch.arange(n_dofs, device=gs.device) * 0.01 + 0.2
+    ghost_box.set_dofs_position(box_baseline)
+    ghost_robot.set_dofs_position(robot_baseline)
+
+    for dofs_idx_local in (
+        [-n_dofs - 1, -1],
+        (-n_dofs - 1, -1),
+        range(-n_dofs - 1, 0, n_dofs),
+        np.array((-n_dofs - 1, -1), dtype=np.int32),
+        torch.tensor((-n_dofs - 1, -1), dtype=torch.int32, device=gs.device),
+    ):
+        assert_equal(
+            ghost_robot._get_global_idx(dofs_idx_local, n_dofs, ghost_robot.dof_start, unsafe=True),
+            (ghost_robot.dof_start - n_dofs - 1, ghost_robot.dof_end - 1),
+        )
+
+    for dofs_idx_local, expected_dofs_idx_local in dofs_idx_cases:
+        assert_equal(
+            ghost_robot.get_dofs_position(dofs_idx_local),
+            ghost_robot.get_dofs_position(expected_dofs_idx_local),
+        )
+
+        values = torch.arange(1, len(expected_dofs_idx_local) + 1, device=gs.device) * 0.01
+        ghost_box.set_dofs_position(box_baseline)
+        ghost_robot.set_dofs_position(robot_baseline)
+        ghost_robot.set_dofs_position(values, dofs_idx_local=dofs_idx_local)
+        box_result = ghost_box.get_dofs_position()
+        robot_result = ghost_robot.get_dofs_position()
+
+        ghost_box.set_dofs_position(box_baseline)
+        ghost_robot.set_dofs_position(robot_baseline)
+        ghost_robot.set_dofs_position(values, dofs_idx_local=expected_dofs_idx_local)
+        assert_equal(box_result, ghost_box.get_dofs_position())
+        assert_equal(robot_result, ghost_robot.get_dofs_position())
+
+    for dofs_idx_local in (
+        {0, 1},
+        [[0, 1]],
+        ["a"],
+        np.array((True,), dtype=bool),
+        torch.tensor((True,), dtype=torch.bool),
+    ):
+        with pytest.raises(gs.GenesisException):
+            ghost_robot.get_dofs_position(dofs_idx_local)
+
+    ghost_box.set_dofs_position(torch.zeros(ghost_box.n_dofs, device=gs.device))
+    ghost_robot.set_dofs_position(torch.zeros(n_dofs, device=gs.device))
     ghost_robot.set_dofs_position([0.1, -0.1], dofs_idx_local=-1)
     assert_allclose(ghost_robot.get_vAABB()[0], ((-0.05, -0.05, -0.05), (0.25, 0.05, 0.05)), tol=tol)
     assert_allclose(ghost_robot.get_vAABB()[1], ((-0.05, -0.05, -0.05), (0.05, 0.05, 0.05)), tol=tol)

@@ -318,6 +318,7 @@ def func_add_contact(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     collider_info: array_class.ColliderInfo,
     use_atomic: qd.template(),
     errno: qd.Tensor,
@@ -340,6 +341,7 @@ def func_add_contact(
             dyn_state,
             collider_state,
             dyn_info,
+            rigid_info,
             collider_info,
             errno,
         )
@@ -363,6 +365,7 @@ def func_set_contact(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     collider_info: array_class.ColliderInfo,
     errno: qd.Tensor,
 ):
@@ -395,9 +398,11 @@ def func_set_contact(
     collider_state.contact_data.friction[i_c, i_b] = qd.max(qd.max(friction_a, friction_b), 1e-2)
     collider_state.contact_data.friction_torsional[i_c, i_b] = qd.max(friction_torsional_a, friction_torsional_b)
     collider_state.contact_data.friction_rolling[i_c, i_b] = qd.max(friction_rolling_a, friction_rolling_b)
-    collider_state.contact_data.sol_params[i_c, i_b] = 0.5 * (
-        dyn_info.geoms.sol_params[i_ga] + dyn_info.geoms.sol_params[i_gb]
-    )
+    # The constraint time constant is floored on the mixed value rather than on each geom's own (see the geom
+    # sanitize site in rigid_solver.py); 2.0 is TIME_CONSTANT_SAFETY_FACTOR (rigid_solver.py).
+    sol_params = 0.5 * (dyn_info.geoms.sol_params[i_ga] + dyn_info.geoms.sol_params[i_gb])
+    sol_params[0] = qd.max(sol_params[0], 2.0 * rigid_info.substep_dt[None])
+    collider_state.contact_data.sol_params[i_c, i_b] = sol_params
     collider_state.contact_data.link_a[i_c, i_b] = dyn_info.geoms.link_idx[i_ga]
     collider_state.contact_data.link_b[i_c, i_b] = dyn_info.geoms.link_idx[i_gb]
     collider_state.contact_data.pair_idx[i_c, i_b] = i_pair
@@ -483,6 +488,26 @@ def func_compute_geom_pair_scale_mj(
 
 
 @qd.func
+def func_compute_mc_tolerance(
+    i_ga,
+    i_gb,
+    geoms_init_AABB: array_class.GeomsInitAABB,
+    dyn_info: array_class.DynInfo,
+    collider_info: array_class.ColliderInfo,
+    rigid_config: qd.template(),
+):
+    """Absolute multi-contact acceptance tolerance of a geom pair.
+
+    Shared by every convex narrowphase arm so the accepted contact set stays backend-independent. The relative
+    tolerance scales with the reference engine's pair scale under MuJoCo compatibility and with the intrinsic pair
+    scale otherwise."""
+    scale = func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB, dyn_info)
+    if qd.static(rigid_config.enable_mujoco_compatibility):
+        scale = func_compute_geom_pair_scale_mj(i_ga, i_gb, geoms_init_AABB, dyn_info)
+    return collider_info.mc_tolerance[None] * scale
+
+
+@qd.func
 def func_contact_orthogonals(
     i_ga,
     i_gb,
@@ -524,13 +549,13 @@ def func_contact_orthogonals(
             volume_gb = size_gb[0] * size_gb[1] * size_gb[2]
             i_g = i_ga if volume_ga < volume_gb else i_gb
 
-        # The basis is built in the reference geom's own frame - the frame its support lookup is indexed in, which a
-        # geom offset from the link makes distinct from the inertial one - and rotated back to world, so a scene and any rigidly
-        # rotated copy of it perturb along the same directions relative to the geometry, and the manifold they find is
-        # the same. Selecting an axis by comparing the world normal against world axes instead makes the choice depend
-        # on the orientation of the whole scene, and it ties outright for a geom with no preferred axis, where two
-        # equal principal moments leave the selection to rounding and the manifold jumps between two sets.
-        rot = gu.qd_quat_to_R(dyn_state.geoms.quat[i_g, i_b], EPS)
+        # The basis is built in the reference geom's local inertial frame, the physical anchor that does not depend on
+        # the link origin, maintained by forward kinematics as links.quat composed with the build-time local inertial
+        # quat, then rotated back to world. Building the orthogonals on the LOCAL normal keeps the construction's branch
+        # decisions fixed to the body, so a scene and any rigidly rotated copy of it perturb along the same directions
+        # relative to the geometry and find the same manifold.
+        i_l = dyn_info.geoms.link_idx[i_g]
+        rot = gu.qd_quat_to_R(dyn_state.links.i_quat[i_l, i_b], EPS)
         axis_0_local, axis_1_local = gu.qd_orthogonals(rot.transpose() @ normal)
         axis_0 = rot @ axis_0_local
         axis_1 = rot @ axis_1_local
