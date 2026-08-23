@@ -11,8 +11,9 @@ import genesis as gs
 from genesis.options.sensors import RasterizerCameraOptions
 from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind, KeyMod, MouseButton
+from genesis.vis.viewer_plugins.plugins.mouse_interaction import GRAB_ACC
 
-from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_VIEWER
+from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_IMGUI_BUNDLE, SKIP_NO_VIEWER, is_imgui_bundle_supported
 from ..utils.assertions import assert_allclose
 from .conftest import RENDERER_TYPE
 
@@ -65,11 +66,11 @@ def test_disable_defaults():
 def test_default_plugin(n_envs):
     scene = gs.Scene(
         viewer_options=gs.options.ViewerOptions(
+            res=CAM_RES,
+            run_in_thread=(sys.platform == "linux"),
             camera_pos=(2.0, 0.0, 1.0),
             camera_lookat=(0.0, 0.0, 0.0),
             camera_fov=30,
-            res=CAM_RES,
-            run_in_thread=(sys.platform == "linux"),
             enable_help_text=True,
             enable_default_keybinds=True,
         ),
@@ -79,7 +80,9 @@ def test_default_plugin(n_envs):
         show_viewer=True,
     )
 
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, 0.2),
@@ -192,6 +195,7 @@ def test_default_plugin(n_envs):
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
+@pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot):
     IMAGE_FILENAME = tmp_path / "screenshot.png"
 
@@ -216,6 +220,10 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
 
     # Create a scene
     scene = gs.Scene(
+        vis_options=gs.options.VisOptions(
+            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
+            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
+        ),
         viewer_options=gs.options.ViewerOptions(
             # Force screen-independent low-quality resolution when running unit tests for consistency.
             # Still, it must be large enough since rendering text involved alpha blending, which is platform-dependent.
@@ -225,10 +233,6 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
             # was only using rasterizer without interactive viewer:
             # 'EventLoop.run() must be called from the same thread that imports pyglet.app'.
             run_in_thread=(sys.platform == "linux"),
-        ),
-        vis_options=gs.options.VisOptions(
-            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
         ),
         renderer=renderer,
         show_viewer=True,
@@ -294,7 +298,7 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
     BOX_LENGTH = 0.2
     STEPS = 20
     DRAG_DY = 8
-    SPRING_CONST = 1000.0
+    SPRING_SLACK = 0.02
     CAM_FOV = 30
     # Probe lanes parked along y, clear of the drag: envs are spaced along x only, so a lane is one env's alone.
     DECOY_SIZE = 0.4
@@ -322,25 +326,27 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
         viewer_options=gs.options.ViewerOptions(
             # Forces odd resolution so that mouse clicks are centered on pixels
             res=(2 * (CAM_RES[0] // 2) + 1, 2 * (CAM_RES[0] // 2) + 1),
+            run_in_thread=(sys.platform == "linux"),
             camera_pos=CAM_POS,
             # looking to the top of the box at the target env
             camera_lookat=(target_offset[0], target_offset[1], target_offset[2] + BOX_LENGTH),
             camera_fov=CAM_FOV,
-            run_in_thread=(sys.platform == "linux"),
         ),
         show_viewer=True,
         show_FPS=False,
     )
 
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     box = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, BOX_LENGTH / 2),
             size=(BOX_LENGTH, BOX_LENGTH, BOX_LENGTH),
         ),
         material=gs.materials.Rigid(
-            rho=MASS / (BOX_LENGTH**3),
             use_visual_raycasting=True,
+            rho=MASS / (BOX_LENGTH**3),
         ),
     )
     # One lane stacks a collision-only box under a visual-only one, so the two cast modes land on different entities.
@@ -396,7 +402,7 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
     scene.viewer.add_plugin(
         gs.vis.viewer_plugins.MouseInteractionPlugin(
             use_force=True,
-            spring_const=SPRING_CONST,
+            spring_slack=SPRING_SLACK,
             use_visual_geom=use_visual_geom,
         )
     )
@@ -519,7 +525,7 @@ def test_mouse_interaction_plugin(n_envs, env_spacing, n_envs_per_row, target_en
     # FIXME: Use a more accurate model to predict final velocity.
     total_sim_time = STEPS * DT
     avg_mouse_velocity = total_world_displacement / total_sim_time
-    num_tau = total_sim_time * np.sqrt(SPRING_CONST / MASS)
+    num_tau = total_sim_time * np.sqrt(GRAB_ACC / SPRING_SLACK)
     velocity_fraction = 1.0 - (1.0 + num_tau) * np.exp(-num_tau)
     expected_vel_z = avg_mouse_velocity * velocity_fraction
 
@@ -641,7 +647,9 @@ def test_add_camera_consistency(add_box, renderer_type, show_viewer):
         renderer=renderer_type,
         show_viewer=True,
     )
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     if add_box:
         scene.add_entity(
             morph=gs.morphs.Box(
@@ -698,7 +706,9 @@ def test_rasterizer_camera_sensor(renderer):
     )
     # At least one entity is needed to ensure the rendered image is not entirely blank,
     # otherwise it is not possible to verify that something was actually rendered.
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     camera_sensor = scene.add_sensor(
         RasterizerCameraOptions(
             res=CAM_RES,
@@ -772,10 +782,14 @@ def test_thread_crash_reports_traceback():
 
     run_in_thread = sys.platform == "linux"
     scene = gs.Scene(
-        viewer_options=gs.options.ViewerOptions(run_in_thread=run_in_thread),
+        viewer_options=gs.options.ViewerOptions(
+            run_in_thread=run_in_thread,
+        ),
         show_viewer=True,
     )
-    scene.add_entity(morph=gs.morphs.Plane())
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     crash_plugin = CrashOnDrawPlugin()
     scene.viewer.add_plugin(crash_plugin)
     scene.build()

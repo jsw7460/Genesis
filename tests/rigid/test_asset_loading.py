@@ -47,9 +47,21 @@ def test_depth_first_link_ordering(xml_path, model_name, show_viewer):
 @pytest.mark.required
 def test_mjcf_parsing_with_include():
     scene = gs.Scene()
-    robot1 = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/scene.xml"))
-    robot2 = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
-    robot3 = scene.add_entity(gs.morphs.MJCF(file="xml/franka_sim/franka_panda.xml"))
+    robot1 = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file="xml/franka_emika_panda/scene.xml",
+        )
+    )
+    robot2 = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file="xml/franka_emika_panda/panda.xml",
+        )
+    )
+    robot3 = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file="xml/franka_sim/franka_panda.xml",
+        )
+    )
     scene.build()
     assert_allclose(robot1.get_qpos(), robot2.get_qpos(), tol=gs.EPS)
     assert_allclose(robot1.get_qpos(), robot3.get_qpos(), tol=gs.EPS)
@@ -305,9 +317,7 @@ def test_urdf_parsing_merge_fixed_links(urdf_path, fixed, show_viewer, tol):
     POS = (0.0, -0.2, 0.5)
     EULER = (0.0, 90.0, 45.0)
 
-    scene = gs.Scene(
-        show_viewer=show_viewer,
-    )
+    scene = gs.Scene(show_viewer=show_viewer)
     urdf_rootdir = os.path.dirname(urdf_path)
     asset_path = get_hf_dataset(pattern=os.path.join(urdf_rootdir, "*") if urdf_rootdir else urdf_path)
     robot_1 = scene.add_entity(
@@ -371,9 +381,7 @@ def test_mjcf_parsing_merge_fixed_links(xml_path, show_viewer):
     POS = (1.0, 2.0, 3.0)
     QUAT = (0.0, 1.0, 0.0, 0.0)
 
-    scene = gs.Scene(
-        show_viewer=show_viewer,
-    )
+    scene = gs.Scene(show_viewer=show_viewer)
     robot = scene.add_entity(
         gs.morphs.MJCF(
             file=xml_path,
@@ -805,10 +813,10 @@ def test_mesh_primitive_COM(show_viewer):
         scene.step()
     scene.rigid_solver.update_vgeoms()
 
-    _, bunny_COM, cube_COM = rigid.get_links_pos(ref="link_com")
-    _, root_bunny_COM, root_cube_COM = rigid.get_links_pos(ref="root_com")
-    assert_allclose(bunny_COM, bunny.get_links_pos(links_idx_local=[0], ref="link_com"), atol=gs.EPS)
-    assert_allclose(cube_COM, cube.get_links_pos(links_idx_local=[0], ref="link_com"), atol=gs.EPS)
+    _, bunny_COM, cube_COM = rigid.get_links_pos(ref=gs.link_ref_frame.link_COM)
+    _, root_bunny_COM, root_cube_COM = rigid.get_links_pos(ref=gs.link_ref_frame.root_COM)
+    assert_allclose(bunny_COM, bunny.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM), atol=gs.EPS)
+    assert_allclose(cube_COM, cube.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM), atol=gs.EPS)
     assert_allclose(root_bunny_COM, bunny_COM, atol=gs.EPS)
     assert_allclose(root_cube_COM, cube_COM, atol=gs.EPS)
 
@@ -877,7 +885,9 @@ def test_align_mesh(show_viewer, tol):
                 align=True,
             ),
         ),
-        material=gs.materials.Rigid(rho=1000.0),
+        material=gs.materials.Rigid(
+            rho=1000.0,
+        ),
     )
     scene.build(n_envs=2)
 
@@ -895,8 +905,8 @@ def test_align_mesh(show_viewer, tol):
     assert_allclose(mango.get_quat(relative=True), gu.identity_quat(), tol=tol)
     # The world-frame base pose places the link frame at the geometry COM and principal axes.
     assert_allclose(
-        mango.get_links_pos(links_idx_local=[0], ref="link_com", relative=False),
-        mango.get_links_pos(links_idx_local=[0], ref="link_origin", relative=False),
+        mango.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM, relative=False),
+        mango.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_origin, relative=False),
         tol=tol,
     )
     geom_inertia_i = qd_to_numpy(scene.rigid_solver.dyn_state.links.cinr_inertial, transpose=True)[0, 1]
@@ -910,8 +920,10 @@ def test_align_mesh(show_viewer, tol):
         assert_allclose(het_obj.get_pos(relative=True, envs_idx=i_env), HET_POS, tol=tol)
         assert_allclose(het_obj.get_quat(relative=True, envs_idx=i_env), gu.identity_quat(), tol=tol)
         assert_allclose(
-            het_obj.get_links_pos(links_idx_local=[0], ref="link_com", envs_idx=i_env, relative=False),
-            het_obj.get_links_pos(links_idx_local=[0], ref="link_origin", envs_idx=i_env, relative=False),
+            het_obj.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM, envs_idx=i_env, relative=False),
+            het_obj.get_links_pos(
+                links_idx_local=[0], ref=gs.link_ref_frame.link_origin, envs_idx=i_env, relative=False
+            ),
             tol=tol,
         )
 
@@ -983,7 +995,7 @@ def test_align_urdf(show_viewer, tol):
     # The relative (user-frame) base pose strips the alignment back to the morph pose, while the world-frame base
     # pose has its link frame origin at the collision geometry COM (auto-align for basic rigid objects).
     assert_allclose(fork.get_pos(relative=True), INIT_POS, tol=tol)
-    assert_allclose(fork.get_links_pos(ref="link_com"), fork.get_pos(relative=False), tol=tol)
+    assert_allclose(fork.get_links_pos(ref=gs.link_ref_frame.link_COM), fork.get_pos(relative=False), tol=tol)
 
     # Same qpos on rigid and kinematic entities must yield matching vAABB
     qpos = (0.3, -0.2, 1.0, 0.6, 0.5, 0.3, 0.0)
@@ -1271,10 +1283,18 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
         gs.morphs.URDF(file=_build_free_body_urdf("free_body_a", "0.02 0 0"), pos=FREE_POS, align=True),
         gs.morphs.URDF(file=_build_free_body_urdf("free_body_b", "0 0 0.03"), pos=FREE_POS, align=True),
     )
-    free_het = scene.add_entity(morph=free_morph, material=gs.materials.Rigid(rho=200.0))
+    free_het = scene.add_entity(
+        morph=free_morph,
+        material=gs.materials.Rigid(
+            rho=200.0,
+        ),
+    )
     # Kinematic counterpart of the aligned free bodies. The COM/principal anchoring is applied in the base entity, so
     # for the same qpos a kinematic visualization and the rigid body it tracks must place identical world geometry.
-    free_kin = scene.add_entity(morph=free_morph, material=gs.materials.Kinematic())
+    free_kin = scene.add_entity(
+        morph=free_morph,
+        material=gs.materials.Kinematic(),
+    )
     # A free entity whose two variants are identical, so the solver resolves a single shared offset and takes the
     # broadcast path (the base link offset) rather than the per-env variant offset. That shared base offset must still
     # carry the COM anchoring, else the relative getter cannot strip the alignment on this path.
@@ -1282,7 +1302,10 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
         gs.morphs.URDF(file=_build_free_body_urdf("free_dup_a", "0.02 0 0"), pos=FREE_POS, align=True),
         gs.morphs.URDF(file=_build_free_body_urdf("free_dup_b", "0.02 0 0"), pos=FREE_POS, align=True),
     )
-    free_dup = scene.add_entity(morph=dup_morph, material=gs.materials.Rigid())
+    free_dup = scene.add_entity(
+        morph=dup_morph,
+        material=gs.materials.Rigid(),
+    )
     # Free bodies whose root link is empty and whose mass lives on a fixed child (merge_fixed_links=False keeps the
     # wrapper). Alignment folds the child's mass onto the root; the subsumed child keeps only the gs.EPS placeholder.
     WRAP_MASS_A, WRAP_MASS_B = 0.5, 0.25
@@ -1300,7 +1323,9 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
             merge_fixed_links=False,
         ),
     )
-    free_wrapped = scene.add_entity(morph=wrapped_morph)
+    free_wrapped = scene.add_entity(
+        morph=wrapped_morph,
+    )
     scene.build(n_envs=4, env_spacing=(0.0, 0.5))
 
     # Same absolute qpos must map to the same world geometry for the aligned rigid body and its kinematic counterpart;
@@ -1315,8 +1340,10 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
     # with the COM, and the relative getter strips the alignment back to the user pose.
     for i_env in (0, 2):
         assert_allclose(
-            free_het.get_links_pos(links_idx_local=[0], ref="link_com", envs_idx=i_env, relative=False),
-            free_het.get_links_pos(links_idx_local=[0], ref="link_origin", envs_idx=i_env, relative=False),
+            free_het.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM, envs_idx=i_env, relative=False),
+            free_het.get_links_pos(
+                links_idx_local=[0], ref=gs.link_ref_frame.link_origin, envs_idx=i_env, relative=False
+            ),
             tol=tol,
         )
         assert_allclose(free_het.get_pos(relative=True, envs_idx=i_env), FREE_POS, tol=tol)
@@ -1324,8 +1351,8 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
     # The duplicate-variant entity takes the broadcast offset path; its relative getter must still strip the shared COM
     # anchoring back to the user pose in every env (a non-anchored base offset would leave it COM-shifted).
     assert_allclose(
-        free_dup.get_links_pos(links_idx_local=[0], ref="link_com", relative=False),
-        free_dup.get_links_pos(links_idx_local=[0], ref="link_origin", relative=False),
+        free_dup.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_COM, relative=False),
+        free_dup.get_links_pos(links_idx_local=[0], ref=gs.link_ref_frame.link_origin, relative=False),
         tol=tol,
     )
     assert_allclose(free_dup.get_pos(relative=True), FREE_POS, tol=tol)
@@ -1385,8 +1412,8 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
     assert_allclose(mass[0], sphere_base_mass + sphere_moving_mass, tol=tol)
 
     # CoM position: variant B should match explicit URDF inertial origin_xyz
-    com_pos = het_obj.get_links_pos(ref="link_com", relative=False)
-    origin_pos = het_obj.get_links_pos(ref="link_origin", relative=False)
+    com_pos = het_obj.get_links_pos(ref=gs.link_ref_frame.link_COM, relative=False)
+    origin_pos = het_obj.get_links_pos(ref=gs.link_ref_frame.link_origin, relative=False)
     com_offset = com_pos - origin_pos
     # Variant A: CoM offset matches URDF inertial origin
     assert_allclose(com_offset[0, 0], sphere_base_com, tol=tol)
@@ -1468,7 +1495,7 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
     assert_allclose(het_obj.get_links_acc()[..., 2], GRAVITY, tol=tol)
     het_obj.zero_all_dofs_velocity()
     for _ in range(10):
-        scene.rigid_solver.apply_links_external_force(force, links_idx=links_idx, ref="link_com")
+        scene.rigid_solver.apply_links_external_wrench(force, links_idx=links_idx, ref=gs.link_ref_frame.link_COM)
         scene.step()
         assert_allclose(het_obj.get_links_acc(), 0.0, tol=tol)
 

@@ -10,13 +10,13 @@ def main():
     gs.init(backend=gs.cpu)
 
     scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.01,
+        ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0, -3.5, 2.5),
             camera_lookat=(0.0, 0.0, 1.0),
             camera_fov=40,
-        ),
-        sim_options=gs.options.SimOptions(
-            dt=0.01,
         ),
         show_viewer=args.vis,
         show_FPS=False,
@@ -38,11 +38,9 @@ def main():
     for i in range(1000):
         cube_pos = scene.sim.rigid_solver.get_links_pos(link_idx)
         cube_pos[:, :, 2] -= 1
-        force = -100 * cube_pos
-        scene.sim.rigid_solver.apply_links_external_force(force=force, links_idx=link_idx)
-
-        torque = [[[0, 0, rotation_direction * 5]]]
-        scene.sim.rigid_solver.apply_links_external_torque(torque=torque, links_idx=link_idx)
+        scene.sim.rigid_solver.apply_links_external_wrench(
+            force=-100 * cube_pos, torque=[0, 0, rotation_direction * 5], links_idx=link_idx
+        )
 
         scene.step()
 

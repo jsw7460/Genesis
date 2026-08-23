@@ -1371,13 +1371,14 @@ class FEMSolver(Solver):
     def _kernel_get_el2v(
         self,
         element_el_start: qd.i32,
-        n_elements: qd.i32,
+        element_v_start: qd.i32,
         el2v: qd.types.ndarray(),
+        n_elements: qd.i32,
     ):
-        for i_e in range(n_elements):
-            i_global = i_e + element_el_start
+        for i_e_ in range(n_elements):
+            i_e = i_e_ + element_el_start
             for j in qd.static(range(4)):
-                el2v[i_global, j] = self.elements_i[i_global].el2v[j]
+                el2v[i_e_, j] = self.elements_i[i_e].el2v[j] - element_v_start
 
     @qd.kernel
     def _kernel_get_state(
@@ -1552,18 +1553,18 @@ class FEMSolver(Solver):
     def _kernel_set_vertex_constraints(
         self,
         f: qd.i32,
-        verts_idx: qd.types.ndarray(),  # shape [B, V]
-        target_poss: qd.types.ndarray(),  # shape [B, V, 3]
+        verts_idx: qd.types.ndarray(),  # shape [n_selected_envs, n_verts]
+        envs_idx: qd.types.ndarray(),  # shape [n_selected_envs]
+        link_idx: qd.i32,
         is_soft_constraint: qd.i32,
         stiffness: qd.f32,
-        link_idx: qd.i32,
-        link_init_pos: qd.types.ndarray(),  # shape [B, 3]
-        link_init_quat: qd.types.ndarray(),  # shape [B, 4]
-        envs_idx: qd.types.ndarray(),  # shape [B]
+        target_poss: qd.types.ndarray(),  # shape [n_selected_envs, n_verts, 3]
+        link_init_pos: qd.types.ndarray(),  # shape [n_selected_envs, 3]
+        link_init_quat: qd.types.ndarray(),  # shape [n_selected_envs, 4]
     ):
         for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
             i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b, i_v_]
+            i_v = verts_idx[i_b_, i_v_]
             self.vertex_constraints[i_v, i_b].is_constrained = True
             self.vertex_constraints[i_v, i_b].is_soft_constraint = qd.cast(is_soft_constraint, gs.qd_bool)
             self.vertex_constraints[i_v, i_b].stiffness = stiffness
@@ -1578,11 +1579,11 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def _kernel_update_constraint_targets(
-        self, verts_idx: qd.types.ndarray(), new_target_poss: qd.types.ndarray(), envs_idx: qd.types.ndarray()
+        self, verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), new_target_poss: qd.types.ndarray()
     ):
         for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
             i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b, i_v_]
+            i_v = verts_idx[i_b_, i_v_]
             for j in qd.static(range(3)):
                 self.vertex_constraints[i_v, i_b].target_pos[j] = new_target_poss[i_b_, i_v_, j]
 
@@ -1590,5 +1591,5 @@ class FEMSolver(Solver):
     def _kernel_remove_specific_constraints(self, verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray()):
         for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
             i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b, i_v_]
+            i_v = verts_idx[i_b_, i_v_]
             self.vertex_constraints[i_v, i_b].is_constrained = False

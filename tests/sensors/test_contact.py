@@ -19,8 +19,8 @@ def test_gravity_force(n_envs, show_viewer, tol):
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
-            gravity=(0.0, 0.0, GRAVITY),
             dt=DT,
+            gravity=(0.0, 0.0, GRAVITY),
         ),
         profiling_options=gs.options.ProfilingOptions(
             show_FPS=False,
@@ -28,7 +28,9 @@ def test_gravity_force(n_envs, show_viewer, tol):
         show_viewer=show_viewer,
     )
 
-    floor = scene.add_entity(morph=gs.morphs.Plane())
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
 
     # Add duck (with convex decomposition enabled) to offset geom index vs link index
     scene.add_entity(
@@ -133,7 +135,7 @@ def test_gravity_force(n_envs, show_viewer, tol):
         scene.step()
 
     # Make sure that box CoM is valid
-    assert_allclose(box.get_links_pos(ref="root_com")[..., :2], box_com_offset[:2], tol=tol)
+    assert_allclose(box.get_links_pos(ref=gs.link_ref_frame.root_COM)[..., :2], box_com_offset[:2], tol=tol)
 
     assert not bool_sensor_floor.read().any(), "ContactSensor for floor should not detect any contact yet."
     assert not bool_sensor_box_2.read().any(), "ContactSensor for box_2 should not detect any contact yet."
@@ -176,10 +178,14 @@ def test_filter_link_idx(show_viewer, tol):
         sim_options=gs.options.SimOptions(
             gravity=(0.0, 0.0, -10.0),
         ),
-        profiling_options=gs.options.ProfilingOptions(show_FPS=False),
+        profiling_options=gs.options.ProfilingOptions(
+            show_FPS=False,
+        ),
         show_viewer=show_viewer,
     )
-    floor = scene.add_entity(morph=gs.morphs.Plane())
+    floor = scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
     box_on_floor = scene.add_entity(
         morph=gs.morphs.Box(
             size=(0.2, 0.2, 0.2),

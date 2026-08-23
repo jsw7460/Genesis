@@ -9,15 +9,8 @@ import pytest
 import genesis as gs
 from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 
-from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE
+from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_IMGUI_BUNDLE, is_imgui_bundle_supported
 from ..utils.assertions import assert_allclose, assert_pixel_match, rgb_array_to_png_bytes
-
-try:
-    import imgui_bundle  # noqa: F401
-
-    _IMGUI_BUNDLE_AVAILABLE = True
-except ImportError:
-    _IMGUI_BUNDLE_AVAILABLE = False
 
 
 def _apply_deterministic_imgui_overrides(monkeypatch):
@@ -95,24 +88,24 @@ def _apply_deterministic_imgui_overrides(monkeypatch):
 
 def _build_default_scene(*, enable_gui, run_in_thread=False):
     scene = gs.Scene(
+        vis_options=gs.options.VisOptions(
+            shadow=False,
+        ),
         viewer_options=gs.options.ViewerOptions(
             # Keep ``res`` small enough to fit the virtual display area of GitHub-hosted Apple M1 macos-15 runners:
             # the on-screen capture below reads from the window framebuffer, whose size the OS clamps to the display.
             res=(640, 480),
-            camera_pos=(4.5, -1.2, 2.5),
-            camera_lookat=(0.0, -1.2, 0.5),
             # The snapshot test keeps the default ``run_in_thread=False``: its capture path calls
             # ``pyrender_viewer.on_draw`` and reads the window framebuffer directly, which can only run on the
             # thread that owns the GL context.
             run_in_thread=run_in_thread,
+            camera_pos=(4.5, -1.2, 2.5),
+            camera_lookat=(0.0, -1.2, 0.5),
             # ``_render_help_text`` rasterizes "[i]: show keyboard instructions" via Genesis's own font path,
             # which is not byte-identical across software / hardware renderers; disable it so the captured
             # frame contains only the deterministic ImGui overlay.
             enable_help_text=False,
             enable_gui=enable_gui,
-        ),
-        vis_options=gs.options.VisOptions(
-            shadow=False,
         ),
         profiling_options=gs.options.ProfilingOptions(
             show_FPS=False,
@@ -158,7 +151,7 @@ def _build_default_scene(*, enable_gui, run_in_thread=False):
 @pytest.mark.slow  # ~250s
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
-@pytest.mark.skipif(not _IMGUI_BUNDLE_AVAILABLE, reason="imgui-bundle not installed (no Python 3.10 wheels).")
+@pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 def test_control_panel(png_snapshot, monkeypatch):
     scene = _build_default_scene(enable_gui=False)
 
@@ -184,7 +177,7 @@ def test_control_panel(png_snapshot, monkeypatch):
 @pytest.mark.slow  # ~250s
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
-@pytest.mark.skipif(not _IMGUI_BUNDLE_AVAILABLE, reason="imgui-bundle not installed (no Python 3.10 wheels).")
+@pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 @pytest.mark.parametrize("performance_mode", [False, True])
 def test_editing_controls(png_snapshot, monkeypatch):
     # The scene-editing controls (Rebuild Scene, Add Entity, per-entity scale & remove) render enabled in normal
@@ -210,7 +203,7 @@ def test_editing_controls(png_snapshot, monkeypatch):
 @pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
-@pytest.mark.skipif(not _IMGUI_BUNDLE_AVAILABLE, reason="imgui-bundle not installed (no Python 3.10 wheels).")
+@pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 def test_runtime_plugin_toggle_and_pause():
     from genesis.ext.pyrender.overlay.plugin import TOGGLEABLE_PLUGINS
     from genesis.vis.viewer_plugins import MouseInteractionPlugin, ViewerPlugin
@@ -295,7 +288,7 @@ def test_runtime_plugin_toggle_and_pause():
 
 @pytest.mark.required
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
-@pytest.mark.skipif(not _IMGUI_BUNDLE_AVAILABLE, reason="imgui-bundle not installed (no Python 3.10 wheels).")
+@pytest.mark.skipif(not is_imgui_bundle_supported, reason=SKIP_NO_IMGUI_BUNDLE)
 @pytest.mark.parametrize("performance_mode", [False])
 def test_scene_rebuild():
     # enable_gui makes the overlay own an InteractiveScene and rebuild the scene in place: the same Scene
