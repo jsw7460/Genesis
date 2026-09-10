@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -12,9 +13,11 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.constants import link_ref_frame
-from genesis.engine.entities import DroneEntity, RigidEntity
+from genesis.engine.entities import DroneEntity, RigidEntity, TerrainEntity
 from genesis.engine.entities.base_entity import Entity
-from genesis.engine.states import QueriedStates, RigidSolverState
+from genesis.engine.materials import Rigid
+from genesis.engine.states import KinematicSolverCheckpoint, QueriedStates, RigidSolverState
+from genesis.options.morphs import Drone, Morph, Terrain
 from genesis.options.solvers import RigidOptions
 from genesis.utils.misc import (
     DeprecationError,
@@ -31,7 +34,13 @@ from genesis.utils.misc import (
 from genesis.utils.sdf import SDF
 
 from ..base_solver import GravityMixin, MutatedLinks, Solver, StateChange, TimeBasedMixin, mutates
-from ..kinematic_solver import KinematicSolver, _fill_base_link_geom_offsets, _offset_world_shift, _select_links_offset
+from ..kinematic_solver import (
+    KinematicSolver,
+    _balanced_variant_mapping,
+    _fill_base_link_geom_offsets,
+    _offset_world_shift,
+    _select_links_offset,
+)
 from .collider import Collider
 from .constraint import ConstraintSolver
 from .constraint.backward import (
@@ -43,6 +52,7 @@ from .constraint.backward import (
     kernel_manual_add_joint_limit_constraints_bw,
 )
 from .abd.misc import (
+    kernel_init_link_dynamics,
     func_add_safe_backward,
     func_apply_coupling_force,
     func_atomic_add_if,
@@ -60,21 +70,17 @@ from .abd.misc import (
     kernel_init_equality_fields,
     kernel_init_geom_fields,
     kernel_init_joint_fields,
-    kernel_init_link_fields,
     kernel_init_vert_fields,
     kernel_init_vgeom_fields,
     kernel_init_vvert_fields,
     kernel_reset_hibernation,
     kernel_set_zero,
-    kernel_update_geoms_render_T,
     kernel_update_heterogeneous_link_info,
-    kernel_update_vgeoms_render_T,
     kernel_wakeup_coupled_links,
 )
 from .abd.forward_kinematics import (
     func_aggregate_awake_entities,
     func_COM_links,
-    func_COM_links_entity,
     func_forward_kinematics_batch,
     func_forward_kinematics_entity,
     func_forward_velocity,
@@ -84,7 +90,6 @@ from .abd.forward_kinematics import (
     func_update_all_verts,
     func_update_cartesian_space,
     func_update_cartesian_space_batch,
-    func_update_cartesian_space_entity,
     func_update_geoms,
     func_update_geoms_batch,
     func_update_geoms_entity,
@@ -212,6 +217,14 @@ def _sanitize_sol_params(
     sol_params, min_timeconst: float, default_timeconst: float | None = None, *, floor_timeconst: bool = True
 ):
     timeconst, dampratio, dmin, dmax, width, mid, power = sol_params.reshape((-1, 7)).T
+    direct_mask = timeconst < 0.0
+    if direct_mask.any():
+        gs.logger.warning(
+            "Constraint solver `timeconst` is negative, which parameterizes the constraint by its stiffness and its "
+            "damping directly. Genesis does not support it for now, so the default time constant is used instead."
+        )
+        timeconst[direct_mask] = 0.0
+        dampratio[direct_mask] = gu.default_solver_params()[1]
     if (timeconst < gs.EPS).any() and default_timeconst is not None:
         gs.logger.debug(
             f"Constraint solver time constant not specified. Using default value (`{default_timeconst:0.6g}`)."
@@ -244,6 +257,8 @@ def _sanitize_sol_params(
 
 
 class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
+    material_cls = Rigid
+    _entity_classes = ((Drone, DroneEntity), (Terrain, TerrainEntity), (Morph, RigidEntity))
     # override typing
     _entities: list[RigidEntity] = gs.List()
 
@@ -341,53 +356,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def init_ckpt(self):
         pass
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact, name: str | None = None) -> RigidEntity:
-        # Handle heterogeneous morphs (list/tuple of morphs)
-        morph_heterogeneous = []
-        if isinstance(morph, (tuple, list)):
-            morph, *morph_heterogeneous = morph
-            self._enable_heterogeneous |= bool(morph_heterogeneous)
-
-        if isinstance(morph, gs.morphs.Drone):
-            EntityClass = DroneEntity
-        else:
-            EntityClass = RigidEntity
-
-        morph._enable_mujoco_compatibility = self._enable_mujoco_compatibility
-
-        entity = EntityClass(
-            scene=self._scene,
-            solver=self,
-            material=material,
-            morph=morph,
-            surface=surface,
-            idx=idx,
-            idx_in_solver=self.n_entities,
-            link_start=self.n_links,
-            joint_start=self.n_joints,
-            q_start=self.n_qs,
-            dof_start=self.n_dofs,
-            geom_start=self.n_geoms,
-            cell_start=self.n_cells,
-            vert_start=self.n_verts,
-            free_verts_state_start=self.n_free_verts,
-            fixed_verts_state_start=self.n_fixed_verts,
-            face_start=self.n_faces,
-            edge_start=self.n_edges,
-            vgeom_start=self.n_vgeoms,
-            vvert_start=self.n_vverts,
-            vface_start=self.n_vfaces,
-            custom_vvert_start=self.n_custom_vverts,
-            custom_vface_start=self.n_custom_vfaces,
-            visualize_contact=visualize_contact,
-            morph_heterogeneous=morph_heterogeneous,
-            name=name,
-        )
-        assert isinstance(entity, RigidEntity)
-        self._entities.append(entity)
-
-        return entity
-
     def build(self):
         self._n_geoms = self.n_geoms
         self._n_cells = self.n_cells
@@ -421,8 +389,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         super().build()
 
-        self._init_mass_mat()
-
         self._init_vert_fields()
         self._init_geom_fields()
         self._init_equality_fields()
@@ -431,6 +397,50 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._init_collider()
         self._init_constraint_solver()
         self._refresh_invweight_and_meaninertia(force_update=False, in_place=True)
+
+        # Fill in the default rotor inertia (see 'KinematicVariantDescription'), one variant per environment. It is
+        # written to the armature field from the host once the parsed inverse weights stand, and a second refresh
+        # recomputes the ones it changes: those of every degree of freedom and link of the kinematic trees holding a
+        # defaulted joint. The parsed inverse weights stand everywhere else.
+        dofs_idx, dofs_default, dofs_link = [], [], []
+        for entity in self._entities:
+            rotor_links = [
+                link
+                for link in entity.links
+                if link.n_dofs == 1 and link.joints[0].type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC)
+            ]
+            if not rotor_links:
+                continue
+            # Only a scene or robot description file yields a rotor link, and those morphs state a default armature.
+            if entity.desc.variants:
+                variants_default = np.array([variant.default_armature or 0.0 for variant in entity.desc.variants])
+            else:
+                variants_default = np.array([entity.main_morph.default_armature or 0.0])
+            envs_default = variants_default[_balanced_variant_mapping(variants_default.size, self._B)]
+            if (envs_default <= 0.0).all():
+                continue
+            dofs_idx.extend(link.dof_start for link in rotor_links)
+            dofs_default.extend([envs_default] * len(rotor_links))
+            dofs_link.extend(rotor_links)
+        if dofs_idx:
+            # Field layout, batch last, since the arrays are written back as fields.
+            dofs_armature = qd_to_numpy(self.dyn_info.dofs.armature, transpose=False, copy=True)
+            is_default = (np.atleast_2d(dofs_armature[dofs_idx].T) <= 0.0).all(axis=0)
+            if is_default.any():
+                dofs_idx = np.array(dofs_idx)[is_default]
+                default_armature = np.stack(dofs_default, axis=1)[:, is_default]
+                dofs_armature[dofs_idx] = default_armature.T if self._options.batch_dofs_info else default_armature[0]
+                self.dyn_info.dofs.armature.from_numpy(dofs_armature)
+                roots_idx = {link.root_idx for link, is_dof_default in zip(dofs_link, is_default) if is_dof_default}
+                trees_links = [link for link in self.links if link.root_idx in roots_idx]
+                dofs_invweight = qd_to_numpy(self.dyn_info.dofs.invweight, transpose=False, copy=True)
+                dofs_invweight[[i_d for link in trees_links for i_d in range(link.dof_start, link.dof_end)]] = -1.0
+                self.dyn_info.dofs.invweight.from_numpy(dofs_invweight)
+                links_idx = [link.idx for link in trees_links]
+                links_invweight = qd_to_numpy(self.dyn_info.links.invweight, transpose=False, copy=True)
+                links_invweight[links_idx] = -1.0
+                self.dyn_info.links.invweight.from_numpy(links_invweight)
+                self._refresh_invweight_and_meaninertia(force_update=False, in_place=True)
 
         # The constraint solver decides it has converged from quantities summed over the whole scene, and every DOF of
         # a link contributes a cost of the order of the link's mass. A link whose mass is a tolerance-fraction of the
@@ -467,7 +477,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         geoms_offset_pos = np.zeros((self.n_geoms, 3), dtype=gs.np_float)
         geoms_offset_quat = np.tile(gu.identity_quat(), (self.n_geoms, 1))
         for entity in self._entities:
-            ranges = entity.base_link._variant_geom_ranges if entity._variant_offset_pos is not None else None
+            ranges = entity.base_link._variant_geom_ranges if entity._desc.variants else None
             _fill_base_link_geom_offsets(geoms_offset_pos, geoms_offset_quat, entity, entity.geoms, ranges)
         self._geoms_offset_pos = self._geoms_offset_quat = None
         if not (
@@ -523,6 +533,18 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # get_dofs_info reads from solver._options.batch_dofs_info.
         if self._enable_heterogeneous and self._use_hibernation:
             self._options.batch_dofs_info = True
+        # Likewise, the variants of a heterogeneous entity each state their own default armature (see build), which is
+        # per-env on every joint carrying a rotor whenever those defaults differ.
+        for entity in self._entities:
+            variants_default = np.array([variant.default_armature or 0.0 for variant in entity.desc.variants])
+            if variants_default.size < 2 or np.ptp(variants_default) <= gs.EPS:
+                continue
+            has_rotor = any(
+                link.n_dofs == 1 and link.joints[0].type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC)
+                for link in entity.links
+            )
+            if has_rotor:
+                self._options.batch_dofs_info = True
 
         # sparse_solve=None resolves automatically: the skyline-envelope solver pays off on CPU only when the scene
         # has block structure, whereas a single dense-coupled tree gains nothing and pays the per-step envelope tax. An
@@ -643,7 +665,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             rigid_config["prefer_decomposed_solver"] = 0
 
         # Per-DOF mass-block bounds (see dofs_mass_block_start in array_class.py), computed here because the tiled
-        # factor arms below are sized for the largest block; _init_mass_mat uploads them.
+        # factor arms below are sized for the largest block; _init_tree_fields uploads them.
         links_by_idx = {link.idx: link for link in self.links}
         dofs_mass_block_start = np.arange(self.n_dofs_, dtype=gs.np_int)
         for link in self.links:
@@ -845,88 +867,127 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def _jacobi_mass_spread_bound(self):
         """Upper-bound the spread of the mass matrix diagonal over every configuration, from the model alone.
 
-        Each DOF's diagonal entry is bracketed without kinematics. A translational entry is exactly its per-DOF
-        armature plus the subtree mass. A rotational entry is the link the joint carries plus its descendants: with a
-        single joint the link's axis, anchor and centre of mass (COM) are fixed in its frame, so its own term
-        armature + a^T I_anchor a is exact for a revolute axis and bracketed by the principal inertias about the
-        anchor for free/spherical DOFs whose axes turn with the configuration; descendants add at least nothing, at
-        most their largest principal inertia plus their mass carried at an anchor-to-COM distance no configuration
-        exceeds (frame offsets summed along the chain, each joint anchor counted twice since a joint rotation swings
-        the child origin around it, and each prismatic descendant's full travel span, infinite when unlimited). The
-        largest upper bracket over the smallest lower one thus bounds the true diagonal spread at every configuration:
-        equilibration may enable for scenes whose reachable configurations stay better conditioned, never the reverse.
+        Each entry gets a lower and an upper bound that hold in every configuration. A translational entry is armature
+        plus subtree mass exactly. A rotational entry is at least armature plus the link inertia about its axis (the
+        smallest principal inertia for free and spherical DOFs), and at most the same with the largest principal inertia
+        plus, per descendant, its largest principal inertia and its mass times the squared anchor-to-COM distance no
+        configuration exceeds (frame offsets along the chain, each anchor twice, prismatic spans, infinite when
+        unlimited). A build-time default armature adds the value of the variant an entity takes to the entries it fills
+        in, and any variant may be dispatched to any environment, so the bounds are kept per variant of each entity and
+        the spread is the largest over every combination of variants across entities. That spread is at least the true
+        one, so the gate never leaves a scene that needs equilibration without it; its only error is to enable it for a
+        scene that does not, at a small runtime cost.
         """
-        links = [link for entity in self._entities for link in entity.links]
         children = {}
-        for link in links:
-            children.setdefault(link.parent_idx, []).append(link)
+        for entity in self._entities:
+            for link in entity.links:
+                children.setdefault(link.parent_idx, []).append(link)
 
-        lower, upper = [], []
-        for link in links:
-            if link.is_fixed:
-                continue
-            for joint in link.joints:
-                if joint.type == gs.JOINT_TYPE.FIXED:
+        # Per entity, the smallest lower bound and the largest upper bound over its entries, per variant.
+        entities_lower, entities_upper = [], []
+        for entity in self._entities:
+            rotor_links = [
+                link
+                for link in entity.links
+                if link.n_dofs == 1 and link.joints[0].type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC)
+            ]
+            # Only a scene or robot description file yields a rotor link, and those morphs state a default armature.
+            if entity.desc.variants:
+                variants_default = np.array([variant.default_armature or 0.0 for variant in entity.desc.variants])
+            elif rotor_links:
+                variants_default = np.array([entity.main_morph.default_armature or 0.0])
+            else:
+                variants_default = np.zeros(1)
+            lower, upper = [], []
+            for link in entity.links:
+                if link.is_fixed:
                     continue
-                anchor = joint.pos
-                # Anchor-to-COM distance bound per subtree link (see the docstring); the carrying link's own term is
-                # exact only when this joint is its sole joint, since later chained joints re-rotate the link about
-                # their own anchors.
-                is_sole_joint = len(link.joints) == 1
-                if is_sole_joint:
-                    dist_com = {link.idx: np.linalg.norm(link.inertial_pos - anchor)}
-                else:
-                    dist_com = {link.idx: np.linalg.norm(anchor) + np.linalg.norm(link.inertial_pos)}
-                dist_origin = {link.idx: np.linalg.norm(anchor)}
-                sub, stack = [], [link]
-                while stack:
-                    cur = stack.pop()
-                    sub.append(cur)
-                    for child in children.get(cur.idx, []):
-                        hop = np.linalg.norm(child.pos) + 2.0 * sum(np.linalg.norm(j.pos) for j in child.joints)
-                        # A prismatic descendant carries the subtree outward by up to its full travel span (which
-                        # covers the offset from any zero configuration within limits); an unlimited slide makes the
-                        # upper bracket infinite and the gate enables.
-                        hop += sum(np.ptp(j.dofs_limit) for j in child.joints if j.type == gs.JOINT_TYPE.PRISMATIC)
-                        dist_origin[child.idx] = dist_origin[cur.idx] + hop
-                        dist_com[child.idx] = dist_origin[child.idx] + np.linalg.norm(child.inertial_pos)
-                        stack.append(child)
-                sub_mass = sum(l.inertial_mass for l in sub)
-                eigvals = np.linalg.eigvalsh(link.inertial_i)
-                rot_desc_upper = sum(
-                    np.linalg.eigvalsh(l.inertial_i)[-1] + l.inertial_mass * dist_com[l.idx] ** 2
-                    for l in sub
-                    if l is not link
-                )
-                # Carrying link's inertia about the anchor: exact along a fixed axis, principal bracket otherwise.
-                if is_sole_joint:
-                    R_inertial = gu.quat_to_R(link.inertial_quat)
-                    inertia_com = R_inertial @ link.inertial_i @ R_inertial.T
-                    offset_com = link.inertial_pos - anchor
-                    rot_self_lower = eigvals[0]
-                    rot_self_upper = eigvals[-1] + link.inertial_mass * np.dot(offset_com, offset_com)
-                else:
-                    inertia_com = None
-                    offset_com = None
-                    rot_self_lower = eigvals[0]
-                    rot_self_upper = eigvals[-1] + link.inertial_mass * dist_com[link.idx] ** 2
-                for i_d, armature_d in enumerate(joint.dofs_armature):
-                    if joint.type == gs.JOINT_TYPE.PRISMATIC or (joint.type == gs.JOINT_TYPE.FREE and i_d < 3):
-                        lower.append(armature_d + sub_mass)
-                        upper.append(armature_d + sub_mass)
-                    elif joint.type == gs.JOINT_TYPE.REVOLUTE and is_sole_joint:
-                        axis = joint.dofs_motion_ang[i_d]
-                        lever = np.cross(axis, offset_com)
-                        rot_self = axis @ inertia_com @ axis + link.inertial_mass * np.dot(lever, lever)
-                        lower.append(armature_d + rot_self)
-                        upper.append(armature_d + rot_self + rot_desc_upper)
+                is_rotor = link in rotor_links
+                for joint in link.joints:
+                    if joint.type == gs.JOINT_TYPE.FIXED:
+                        continue
+                    anchor = joint.pos
+                    # Anchor-to-COM distance bound per subtree link (see the docstring); the carrying link's own term is
+                    # exact only when this joint is its sole joint, since later chained joints re-rotate the link about
+                    # their own anchors.
+                    is_sole_joint = len(link.joints) == 1
+                    if is_sole_joint:
+                        dist_com = {link.idx: np.linalg.norm(link.desc.inertial_pos - anchor)}
                     else:
-                        lower.append(armature_d + max(rot_self_lower, 0.0))
-                        upper.append(armature_d + rot_self_upper + rot_desc_upper)
-        lower = [val for val in lower if val > 0.0]
-        if not lower or not upper:
+                        dist_com = {link.idx: np.linalg.norm(anchor) + np.linalg.norm(link.desc.inertial_pos)}
+                    dist_origin = {link.idx: np.linalg.norm(anchor)}
+                    sub, stack = [], [link]
+                    while stack:
+                        cur = stack.pop()
+                        sub.append(cur)
+                        for child in children.get(cur.idx, []):
+                            hop = np.linalg.norm(child.desc.pos) + 2.0 * sum(
+                                np.linalg.norm(j.pos) for j in child.joints
+                            )
+                            # A prismatic descendant carries the subtree outward by up to its full travel span (which
+                            # covers the offset from any zero configuration within limits); an unlimited slide makes the
+                            # upper bound infinite and the gate enables.
+                            hop += sum(
+                                np.ptp(j.desc.dofs_limit) for j in child.joints if j.type == gs.JOINT_TYPE.PRISMATIC
+                            )
+                            dist_origin[child.idx] = dist_origin[cur.idx] + hop
+                            dist_com[child.idx] = dist_origin[child.idx] + np.linalg.norm(child.desc.inertial_pos)
+                            stack.append(child)
+                    sub_mass = sum(l.desc.mass for l in sub)
+                    eigvals = np.linalg.eigvalsh(link.desc.inertia)
+                    rot_desc_upper = sum(
+                        np.linalg.eigvalsh(l.desc.inertia)[-1] + l.desc.mass * dist_com[l.idx] ** 2
+                        for l in sub
+                        if l is not link
+                    )
+                    # Carrying link's inertia about the anchor: exact along a fixed axis, otherwise between its smallest
+                    # and largest principal inertia.
+                    if is_sole_joint:
+                        R_inertial = gu.quat_to_R(link.desc.inertial_quat)
+                        inertia_com = R_inertial @ link.desc.inertia @ R_inertial.T
+                        offset_com = link.desc.inertial_pos - anchor
+                        rot_self_lower = eigvals[0]
+                        rot_self_upper = eigvals[-1] + link.desc.mass * np.dot(offset_com, offset_com)
+                    else:
+                        inertia_com = None
+                        offset_com = None
+                        rot_self_lower = eigvals[0]
+                        rot_self_upper = eigvals[-1] + link.desc.mass * dist_com[link.idx] ** 2
+                    for i_d, armature_d in enumerate(joint.desc.dofs_armature):
+                        if is_rotor and armature_d <= 0.0:
+                            armature = variants_default
+                        else:
+                            armature = np.full(variants_default.size, armature_d)
+                        if joint.type == gs.JOINT_TYPE.PRISMATIC or (joint.type == gs.JOINT_TYPE.FREE and i_d < 3):
+                            lower.append(armature + sub_mass)
+                            upper.append(armature + sub_mass)
+                        elif joint.type == gs.JOINT_TYPE.REVOLUTE and is_sole_joint:
+                            axis = joint.desc.dofs_motion_ang[i_d]
+                            lever = np.cross(axis, offset_com)
+                            rot_self = axis @ inertia_com @ axis + link.desc.mass * np.dot(lever, lever)
+                            lower.append(armature + rot_self)
+                            upper.append(armature + rot_self + rot_desc_upper)
+                        else:
+                            lower.append(armature + max(rot_self_lower, 0.0))
+                            upper.append(armature + rot_self_upper + rot_desc_upper)
+            if lower:
+                lower, upper = np.array(lower), np.array(upper)
+                entities_lower.append(np.where(lower > 0.0, lower, np.inf).min(axis=0))
+                entities_upper.append(upper.max(axis=0))
+        if not entities_lower:
             return 0.0
-        return max(upper) / min(lower)
+
+        # The largest upper bound of a variant pairs with the smallest lower bound reachable alongside it: its own, or
+        # the one of any variant of another entity. A variant without a positive lower bound has no spread to speak of.
+        lower_min = np.array([entity_lower.min() for entity_lower in entities_lower])
+        mass_spread = 0.0
+        for i_e, (entity_lower, entity_upper) in enumerate(zip(entities_lower, entities_upper)):
+            lower_paired = np.minimum(entity_lower, np.delete(lower_min, i_e).min(initial=np.inf))
+            is_bounded = np.isfinite(lower_paired)
+            mass_spread_entity = np.zeros_like(entity_upper)
+            np.divide(entity_upper, lower_paired, out=mass_spread_entity, where=is_bounded)
+            mass_spread = max(mass_spread, mass_spread_entity.max())
+        return mass_spread
 
     def _refresh_invweight_and_meaninertia(self, envs_idx=None, *, force_update=True, in_place=False):
         # Every kinematic tree of the solver is recomputed. A change limited to some links is handled by the setter
@@ -965,7 +1026,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_vel_updated,
         )
 
-    def _init_mass_mat(self):
+    def _init_tree_fields(self):
+        """Initialize the fields describing the kinematic trees, the structure of the joint-space mass matrix
+        included."""
+        super()._init_tree_fields()
+
         self.mass_mat = self.rigid_info.mass_mat
         self.mass_mat_L = self.rigid_info.mass_mat_L
         self.mass_mat_D_inv = self.rigid_info.mass_mat_D_inv
@@ -989,13 +1054,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # Per-DOF mass-block bounds, computed by _build_static_config (which sizes the tiled factor arms from them).
         dofs_mass_block_start = self._dofs_mass_block_start
         dofs_mass_block_end = self._dofs_mass_block_end
-
-        # See links_tree_end in array_class.py: one past the last link of each tree, which may reach past interleaved
-        # links of other trees (the CRB fold gates on root_idx).
-        links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
-        links_tree_end = np.zeros(self.n_links_, dtype=gs.np_int)
-        if self.links:
-            np.maximum.at(links_tree_end, links_root_idx, np.arange(self.n_links) + 1)
 
         # An aligned free body whose only DOFs are its own free joint has a diagonal joint-space mass block, so zero its
         # within-link off-diagonal mask to make the assembled mass exactly diagonal (else ~1e-6 round-off once it
@@ -1037,7 +1095,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.rigid_info.mass_parent_mask.from_numpy(mass_parent_mask)
         self.rigid_info.dofs_mass_block_start.from_numpy(dofs_mass_block_start)
         self.rigid_info.dofs_mass_block_end.from_numpy(dofs_mass_block_end)
-        self.rigid_info.links_tree_end.from_numpy(links_tree_end)
         self.rigid_info.entities_mass_block_dof_start.from_numpy(entities_mass_block_dof_start)
         self.rigid_info.entities_mass_block_dof_end.from_numpy(entities_mass_block_dof_end)
 
@@ -1049,8 +1106,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         ranges and per-variant inertial properties. Per-variant inertial is pre-computed during
         link._build() from actual geom objects, using analytic formulas for primitives.
         """
-        from genesis.engine.solvers.kinematic_solver import _balanced_variant_mapping
-
         for link in self.links:
             if link._variant_vgeom_ranges is None:
                 continue
@@ -1097,6 +1152,22 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 vgeom.active_envs_mask = torch.tensor(active_envs_mask, device=gs.device)
                 (vgeom.active_envs_idx,) = np.where(active_envs_mask)
 
+    def _init_link_fields(self):
+        # The base initialization ends by dispatching each heterogeneous variant's inertial per environment, which
+        # must write last, so this runs first.
+        if self.links:
+            links = self.links
+            kernel_init_link_dynamics(
+                np.array([link.desc.invweight for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_pos for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertial_quat for link in links], dtype=gs.np_float),
+                np.array([link.desc.inertia for link in links], dtype=gs.np_float),
+                np.array([link.desc.mass for link in links], dtype=gs.np_float),
+                self.dyn_info,
+            )
+
+        super()._init_link_fields()
+
     def _init_vert_fields(self):
         if self.n_verts > 0:
             geoms = self.geoms
@@ -1140,11 +1211,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     def _init_geom_fields(self):
         self.geoms_init_AABB = self.rigid_info.geoms_init_AABB
-        self._geoms_render_T = np.empty((self.n_geoms_, self._B, 4, 4), dtype=np.float32)
 
         if self.n_geoms > 0:
             geoms = self.geoms
-            geoms_sol_params = np.array([geom.sol_params for geom in geoms], dtype=gs.np_float)
+            geoms_sol_params = np.array([geom.desc.sol_params for geom in geoms], dtype=gs.np_float)
             # A geom keeps the time constant the model states; the floor lands on the value a contact mixes out of its
             # two geoms (see func_set_contact_data), the value the solver actually consumes. Flooring per geom would
             # raise the mix of a pair that is already above the floor, distorting the stated stiffness with no
@@ -1200,9 +1270,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 np.array(geoms_center, dtype=gs.np_float),
                 np.array([geom.init_quat for geom in geoms], dtype=gs.np_float),
                 np.array([geom.type for geom in geoms], dtype=gs.np_int),
-                np.array([geom.friction for geom in geoms], dtype=gs.np_float),
-                np.array([geom.friction_torsional for geom in geoms], dtype=gs.np_float),
-                np.array([geom.friction_rolling for geom in geoms], dtype=gs.np_float),
+                np.array([geom.desc.friction for geom in geoms], dtype=gs.np_float),
+                np.array([geom.desc.friction_torsional for geom in geoms], dtype=gs.np_float),
+                np.array([geom.desc.friction_rolling for geom in geoms], dtype=gs.np_float),
                 geoms_sol_params,
                 np.array([geom.data for geom in geoms], dtype=gs.np_float),
                 np.array([geom.is_convex for geom in geoms], dtype=gs.np_bool),
@@ -1243,7 +1313,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_equalities > 0:
             equalities = self.equalities
 
-            equalities_sol_params = np.array([equality.sol_params for equality in equalities], dtype=gs.np_float)
+            equalities_sol_params = np.array([equality.desc.sol_params for equality in equalities], dtype=gs.np_float)
             _sanitize_sol_params(equalities_sol_params, self._sol_min_timeconst, self._sol_default_timeconst)
 
             kernel_init_equality_fields(
@@ -1313,7 +1383,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._func_constraint_force()
             kernel_step_2(
                 self.dyn_state,
-                self.collider._collider_state,
+                self.collider.collider_state,
                 self.constraint_solver.constraint_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -1340,19 +1410,19 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             errno = kernel_bit_reduction(self._errno)
 
         if errno & array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS:
-            max_collision_pairs_broad = self.collider._collider_info.max_collision_pairs_broad[None]
+            max_collision_pairs_broad = self.collider.collider_info.max_collision_pairs_broad[None]
             gs.raise_exception(
                 f"Exceeding max number of broad phase candidate contact pairs ({max_collision_pairs_broad}). "
                 f"Please increase the value of RigidSolver's option 'multiplier_collision_broad_phase'."
             )
         if errno & array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS:
-            max_candidate_contacts = self.collider._collider_info.max_candidate_contacts[None]
+            max_candidate_contacts = self.collider.collider_info.max_candidate_contacts[None]
             gs.raise_exception(
                 f"Exceeding max number of candidate contact points ({max_candidate_contacts}). Please increase the "
                 "value of RigidSolver's option 'max_collision_pairs'."
             )
         if errno & array_class.ErrorCode.OVERFLOW_CONTACTS:
-            max_contacts = self.collider._collider_info.max_contacts[None]
+            max_contacts = self.collider.collider_info.max_contacts[None]
             gs.raise_exception(
                 f"Exceeding max number of post-pruning contact points ({max_contacts}) supported by the constraint "
                 "solver. Please increase the value of RigidSolver's option 'max_contacts'."
@@ -1377,10 +1447,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # TODO: support batching
         self._kernel_detect_collision()
 
-        n_collision = qd_to_numpy(self.collider._collider_state.n_contacts)[env_idx]
+        n_collision = qd_to_numpy(self.collider.collider_state.n_contacts)[env_idx]
         collision_pairs = np.empty((n_collision, 2), dtype=np.int32)
-        collision_pairs[:, 0] = qd_to_numpy(self.collider._collider_state.contact_data.geom_a)[:n_collision, env_idx]
-        collision_pairs[:, 1] = qd_to_numpy(self.collider._collider_state.contact_data.geom_b)[:n_collision, env_idx]
+        collision_pairs[:, 0] = qd_to_numpy(self.collider.collider_state.contact_data.geom_a)[:n_collision, env_idx]
+        collision_pairs[:, 1] = qd_to_numpy(self.collider.collider_state.contact_data.geom_b)[:n_collision, env_idx]
 
         return collision_pairs
 
@@ -1395,7 +1465,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             if self._use_hibernation:
                 kernel_wake_up_entities_on_new_contact(
                     self.dyn_state,
-                    self.collider._collider_state,
+                    self.collider.collider_state,
                     self.constraint_solver.constraint_state,
                     self.dyn_info,
                     self.rigid_info,
@@ -1447,7 +1517,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         )
 
         if self._enable_collision:
-            collider_state = self.collider._collider_state
+            collider_state = self.collider.collider_state
             qd_zero_grad(collider_state.contact_data.pos)
             qd_zero_grad(collider_state.contact_data.normal)
             qd_zero_grad(collider_state.contact_data.penetration)
@@ -1467,7 +1537,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self._enable_joint_limit:
             kernel_manual_add_joint_limit_constraints_bw(
                 self.dyn_state,
-                self.collider._collider_state,
+                self.collider.collider_state,
                 constraint_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -1674,7 +1744,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         kernel_step_2.grad(
             self.dyn_state,
-            self.collider._collider_state,
+            self.collider.collider_state,
             self.constraint_solver.constraint_state,
             self.dyn_info,
             self.rigid_info,
@@ -1720,7 +1790,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             update_qacc_from_qvel_delta(self.dyn_state, self.rigid_info, self.rigid_config)
             kernel_step_2(
                 self.dyn_state,
-                self.collider._collider_state,
+                self.collider.collider_state,
                 self.constraint_solver.constraint_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -1733,13 +1803,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             # Collision exclusion for IPC-coupled links is handled in the collider at build time.
             if self.sim.coupler.has_any_rigid_coupling:
                 self.substep(f)
-
-    # ------------------------------------------------------------------------------------
-    # ----------------------------------- render -----------------------------------------
-    # ------------------------------------------------------------------------------------
-
-    def update_geoms_render_T(self):
-        kernel_update_geoms_render_T(self._geoms_render_T, self.dyn_state, self.rigid_info, self.rigid_config)
 
     # ------------------------------------------------------------------------------------
     # -------------------------------- state get/set -------------------------------------
@@ -1934,9 +1997,28 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
 
+        self._restart()
+
+    @property
+    def data(self) -> Iterator[array_class.DataItem]:
+        yield from super().data
+        yield from self.collider.data
+        yield from self.constraint_solver.data
+
+    def _restart(self):
+        """Clear the contact and equality caches of the last query and re-arm the once-per-step propeller guard of
+        each drone (see 'set_propellers_rpm').
+        """
+        self.collider._contact_data_cache.clear()
+        self.constraint_solver._eq_const_info_cache.clear()
         for entity in self.entities:
             if isinstance(entity, DroneEntity):
                 entity._prev_prop_t = -1
+
+    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
+    def __setstate__(self, state: KinematicSolverCheckpoint) -> None:
+        super().__setstate__(state)
+        self._restart()
 
     def process_input(self, in_backward=False):
         for entity in self._entities:
@@ -2004,11 +2086,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if links_idx is None:
             links_idx = self._base_links_idx
 
-        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
-        if relative and self._links_offset_pos is None:
+        # Without any offset position on the targeted links, the authored and internal link origins coincide, so a
+        # relative set is just an absolute one.
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        if relative and self._links_offset_pos_is_identity[idx].all():
             relative = False
 
-        # Map a single base link's user position to world here (keeping the current orientation) so the zero-copy
+        # Map a single base link's authored position to world here (keeping the current orientation) so the zero-copy
         # in-place write below still applies, both for an environment-uniform and a per-environment offset. Multi-link
         # relative sets are composed in the kernel branch instead.
         if relative and isinstance(links_idx, int):
@@ -2067,8 +2151,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 pos = pos[None]
 
             if relative:
-                # Compose the body-frame offset onto the user position, keeping the current orientation, then set the
-                # resulting world position absolutely.
+                # Compose the body-frame offset onto the authored position, keeping the current orientation, then set
+                # the resulting world position absolutely.
                 cur_quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
                 offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
                 offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
@@ -2126,16 +2210,19 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if links_idx is None:
             links_idx = self._base_links_idx
 
-        # Without any pose offset, the user and world frames coincide, so a relative set is just an absolute one.
-        if relative and self._links_offset_quat is None:
+        # Without any pose offset on the targeted links, the authored and internal link origins coincide, so a relative
+        # set is just an absolute one.
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        if relative and (
+            self._links_offset_quat_is_identity[idx].all() and self._links_offset_pos_is_identity[idx].all()
+        ):
             relative = False
 
-        # Computed once and reused by the int fast path and the kernel branch below.
-        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        # Reused by the int fast path and the kernel branch below.
         relative_pos_passthrough = relative and self._links_offset_pos_is_identity[idx].all()
 
-        # Compose a single base link's user orientation to world here so the zero-copy in-place write below still
-        # applies, both for an environment-uniform and a per-environment offset. This only preserves the user-frame
+        # Compose a single base link's authored orientation to world here so the zero-copy in-place write below still
+        # applies, both for an environment-uniform and a per-environment offset. This only preserves the authored-frame
         # position when the offset position is identity; a non-zero offset position rotates with the orientation and
         # is handled (together with multi-link relative sets) in the kernel branch instead.
         if isinstance(links_idx, int) and relative_pos_passthrough:
@@ -2191,13 +2278,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             if relative:
                 offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
                 if not relative_pos_passthrough:
-                    # The offset position rotates with the orientation, so keep the user-frame position fixed by
-                    # rewriting the world position from the current user position and the new user orientation.
+                    # The offset position rotates with the orientation, so keep the authored-frame position fixed by
+                    # rewriting the world position from the current authored position and the new authored orientation.
                     cur_pos = qd_to_torch(self.dyn_state.links.pos, envs_idx, links_idx, transpose=True, copy=True)
                     cur_quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
                     offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
-                    user_pos = cur_pos - _offset_world_shift(offset_pos, offset_quat, cur_quat)
-                    world_pos = user_pos + gu.transform_by_quat(offset_pos, quat)
+                    authored_pos = cur_pos - _offset_world_shift(offset_pos, offset_quat, cur_quat)
+                    world_pos = authored_pos + gu.transform_by_quat(offset_pos, quat)
                     kernel_set_links_pos(
                         links_idx,
                         envs_idx,
@@ -2207,7 +2294,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                         self.rigid_info,
                         self.rigid_config,
                     )
-                # Compose the offset onto the user orientation, then set the resulting world orientation absolutely.
+                # Compose the offset onto the authored orientation, then set the resulting world orientation absolutely.
                 quat = gu.transform_quat_by_quat(offset_quat, quat)
                 relative = False
 
@@ -2263,6 +2350,19 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # tensor of one number repeated: no inertia of any body.
         if shape and np.shape(values)[-len(shape) :] != shape:
             gs.raise_exception(f"{name} is {shape} per link, and {np.shape(values)} cannot be read as that.")
+        # The anchor check below reads the written indices as given, in any form the sanitizer accepts. A tensor on a
+        # GPU device is read back in debug mode only, since that stalls the GPU.
+        links_idx_ = None
+        if links_idx is None:
+            links_idx_ = range(self.n_links)
+        elif not isinstance(links_idx, torch.Tensor) or gs.debug or links_idx.device.type == "cpu":
+            (links_idx_,) = indices_to_mask(links_idx, keepdim=False, to_torch=False, boolean_mask=False)
+            if isinstance(links_idx_, slice):
+                links_idx_ = range(*links_idx_.indices(self.n_links))
+            elif isinstance(links_idx_, torch.Tensor):
+                links_idx_ = tensor_to_array(links_idx_)
+            if np.ndim(links_idx_) == 0:
+                links_idx_ = (links_idx_,)
         values, links_idx, envs_idx = self._sanitize_io_variables(
             values,
             links_idx,
@@ -2273,24 +2373,45 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             batched=self._options.batch_links_info,
             skip_allocation=True,
         )
-        if name != "mass":
-            # TODO: An aligned link is anchored on its own center of mass and principal axes, which is what makes its
-            # mass block diagonal (see _init_mass_mat), so writing either one leaves the anchoring behind. Following
-            # the value instead means moving the frame, which shifts the local pose of every geom of the fixed subtree
-            # ('GeomsInfo.pos' / 'quat', one entry per geom, shared by all environments), so a per-environment value
-            # has no frame to go to. It also moves 'qpos', which is quoted in the anchored frame, and the origin a
-            # fixed child reports. Lifting this takes geom info batched per environment.
-            aligned_idx = next((i_l for i_l in tensor_to_array(links_idx) if self.links[i_l].aligned), None)
-            if aligned_idx is not None:
-                link = self.links[aligned_idx]
+        if links_idx_ is not None:
+            # TODO: the anchor of an aligned root keeps its mass block diagonal (see _init_tree_fields). A center of
+            # mass or an inertia written on any link of the body moves the anchor. A mass write keeps it only as one
+            # rescale of every link of the body, inertia included. A frame move shifts the local pose of every geom
+            # ('GeomsInfo.pos' / 'quat', one entry per geom for all environments). It also shifts 'qpos', quoted in the
+            # anchored frame, and the origin a fixed child reports. A per-environment value has no frame to go to, so
+            # the guard stays until 'GeomsInfo' gets a batch dimension.
+            links_anchor = []
+            for link in self.links:
+                anchor = link
+                while anchor.parent_idx != -1 and all(joint.type == gs.JOINT_TYPE.FIXED for joint in anchor.joints):
+                    anchor = self.links[anchor.parent_idx]
+                links_anchor.append(anchor if anchor.aligned else None)
+            values_idx_by_link = {i_l: i_col for i_col, i_l in enumerate(links_idx_)}
+            for i_l in values_idx_by_link:
+                anchor = links_anchor[i_l]
+                if anchor is None:
+                    continue
+                links_idx_body = [link.idx for link in self.links if links_anchor[link.idx] is anchor]
+                if name == "mass" and len(links_idx_body) == 1:
+                    continue
+                if name == "mass" and scale_inertia and all(i_b in values_idx_by_link for i_b in links_idx_body):
+                    # The rescale check reads the values back and stalls the GPU, so it runs in debug mode only.
+                    if not gs.debug:
+                        continue
+                    ratios = values[..., [values_idx_by_link[i_b] for i_b in links_idx_body]]
+                    ratios = ratios / self.get_links_mass(links_idx_body, envs_idx)
+                    if torch.allclose(ratios, ratios[..., :1], rtol=gs.EPS, atol=gs.EPS):
+                        continue
+                link = self.links[i_l]
                 remedy = (
                     "Load the entity with 'align=False' to write inertial properties at runtime."
                     if isinstance(link.entity.main_morph, gs.options.morphs.FileMorph)
                     else "Writing the inertial properties of a primitive morph is not supported yet."
                 )
+                what = {"mass": "mass", "COM": "center of mass", "inertia": "inertia"}[name]
                 gs.raise_exception(
-                    f"Cannot set the {'center of mass' if name == 'COM' else 'inertia'} of link '{link.name}': its "
-                    f"frame is anchored on the center of mass and principal axes of its body. {remedy}"
+                    f"Cannot set the {what} of link '{link.name}': the frame of its body is anchored on the center of "
+                    f"mass and principal axes of all its links. Set the mass of the whole entity instead. {remedy}"
                 )
 
         envs_idx = envs_idx if self._options.batch_links_info else self._scene._envs_idx
@@ -2368,7 +2489,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 links = (self.links[links_idx],)
             else:
                 links = [self.links[i_l] for i_l in links_idx]
-            if sum(0.0 if link.is_fixed else link.inertial_mass for link in links) <= gs.EPS:
+            if sum(0.0 if link.is_fixed else link.desc.mass for link in links) <= gs.EPS:
                 gs.raise_exception(
                     "None of the links being set holds a mass to spread out, so there is no mass to set."
                 )
@@ -2833,6 +2954,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         ref: link_ref_frame = link_ref_frame.link_origin,
         relative=False,
     ):
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
         if not gs.use_zerocopy:
             _, links_idx, envs_idx = self._sanitize_io_variables(
                 None, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
@@ -2849,18 +2971,25 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             tensor = qd_to_torch(self.dyn_state.links.pos, envs_idx, links_idx, transpose=True, copy=True)
 
         # The pose offset is defined on the link origin, so it is only stripped for the 'link_origin' reference.
-        if relative and ref_frame == link_ref_frame.link_origin and self._links_offset_pos is not None:
-            quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True, copy=True)
+        if relative and ref_frame == link_ref_frame.link_origin and not self._links_offset_pos_is_identity[idx].all():
+            quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True)
             offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
             offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
             tensor -= _offset_world_shift(offset_pos, offset_quat, quat)
 
         return tensor[0] if self.n_envs == 0 else tensor
 
-    def get_links_vel(self, links_idx=None, envs_idx=None, *, ref: link_ref_frame = link_ref_frame.link_origin):
+    def get_links_vel(
+        self, links_idx=None, envs_idx=None, *, ref: link_ref_frame = link_ref_frame.link_origin, relative=False
+    ):
         ref_frame = self._sanitize_ref_frame(ref, has_root_COM=False)
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
+        # Only the 'link_origin' reference carries the offset, as in 'get_links_pos'.
+        is_relative = (
+            relative and ref_frame == link_ref_frame.link_origin and not self._links_offset_pos_is_identity[idx].all()
+        )
         if gs.use_zerocopy:
-            mask = (0, *indices_to_mask(links_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, links_idx)
+            mask = indices_to_mask(envs_idx, links_idx)
             cd_vel = qd_to_torch(self.dyn_state.links.cd_vel, transpose=True)
             cd_ang = qd_to_torch(self.dyn_state.links.cd_ang, transpose=True)
             if ref_frame == link_ref_frame.link_COM:
@@ -2870,22 +2999,47 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 pos = qd_to_torch(self.dyn_state.links.pos, transpose=True)
                 root_COM = qd_to_torch(self.dyn_state.links.root_COM, transpose=True)
                 delta = pos[mask] - root_COM[mask]
-            return cd_vel[mask] + cd_ang[mask].cross(delta, dim=-1)
+                if is_relative:
+                    quat = qd_to_torch(self.dyn_state.links.quat, envs_idx, links_idx, transpose=True)
+                    offset_pos = _select_links_offset(self._links_offset_pos, links_idx, envs_idx)
+                    offset_quat = _select_links_offset(self._links_offset_quat, links_idx, envs_idx)
+                    delta = delta - _offset_world_shift(offset_pos, offset_quat, quat)
+            tensor = cd_vel[mask] + cd_ang[mask].cross(delta, dim=-1)
+            return tensor[0] if self.n_envs == 0 else tensor
 
         _tensor, links_idx, envs_idx = self._sanitize_io_variables(
             None, links_idx, self.n_links, "links_idx", envs_idx, (3,)
         )
-        assert _tensor is not None
         tensor = _tensor[None] if self.n_envs == 0 else _tensor
-        kernel_get_links_vel(links_idx, envs_idx, tensor, self.dyn_state, self.rigid_config, ref_frame)
+        kernel_get_links_vel(
+            links_idx,
+            envs_idx,
+            tensor,
+            self._links_offset_pos,
+            self._links_offset_quat,
+            self.dyn_state,
+            self.rigid_config,
+            ref_frame,
+            is_relative=is_relative,
+        )
         return _tensor
 
-    def get_links_acc(self, links_idx=None, envs_idx=None):
+    def get_links_acc(self, links_idx=None, envs_idx=None, *, relative=False):
+        idx = links_idx if isinstance(links_idx, int) else slice(None)
         _tensor, links_idx, envs_idx = self._sanitize_io_variables(
             None, links_idx, self.n_links, "links_idx", envs_idx, (3,)
         )
         tensor = _tensor[None] if self.n_envs == 0 else _tensor
-        kernel_get_links_acc(links_idx, envs_idx, tensor, self.dyn_state, self.rigid_config)
+        kernel_get_links_acc(
+            links_idx,
+            envs_idx,
+            tensor,
+            self._links_offset_pos,
+            self._links_offset_quat,
+            self.dyn_state,
+            self.rigid_config,
+            is_relative=relative and not self._links_offset_pos_is_identity[idx].all(),
+        )
         return _tensor
 
     def get_links_acc_ang(self, links_idx=None, envs_idx=None):
@@ -3153,10 +3307,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def get_potential_energy(self, links_idx=None, dofs_idx=None, envs_idx=None):
         """Get the potential energy of the specified links and DOFs in Joules [J] (gravitational + joint springs).
 
-        Gravity contributes ``-sum_i(m_i * g^T * p_i)`` over the links, where ``p_i`` is the center of mass (COM)
-        position of link *i*. Joint springs contribute ``0.5 * sum_d(stiffness_d * (q_d - q0_d)^2)``, the elastic
-        energy stored by holding each DOF away from its neutral position. Both are state functions, so their sum with
-        the kinetic energy is conserved by a passive, frictionless, contact-free model.
+        Gravity contributes ``-sum_i(m_i * g^T * p_i)`` over the links free to move, where ``p_i`` is the center of
+        mass (COM) position of link *i*. A link fixed to the world is left out, as it is of the mass of an entity: its
+        potential is a constant of the scene. Joint springs contribute ``0.5 * sum_d(stiffness_d * (q_d - q0_d)^2)``,
+        the elastic energy stored by holding each DOF away from its neutral position. Both are state functions, so
+        their sum with the kinetic energy is conserved by a passive, frictionless, contact-free model.
 
         Contacts contribute nothing: they are resolved by the constraint solver, which stabilizes a penetration
         rather than storing it as an elastic potential.
@@ -3176,7 +3331,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """
         gravity = self.get_gravity(envs_idx=envs_idx)  # (3,) or (n_envs, 3)
         links_pos = self.get_links_pos(links_idx, envs_idx, ref=link_ref_frame.link_COM)  # (..., n_links, 3)
-        links_mass = self.get_links_mass(links_idx, envs_idx if self._options.batch_links_info else None)
+        links_envs_idx = envs_idx if self._options.batch_links_info else None
+        links_mass = qd_to_torch(self.dyn_info.links.inertial_mass, links_envs_idx, links_idx, transpose=True)
+        links_is_fixed = qd_to_torch(self.dyn_info.links.is_fixed, links_envs_idx, links_idx, transpose=True)
+        links_mass = links_mass.masked_fill(links_is_fixed.to(torch.bool), 0.0)
+        if self.n_envs == 0 and self._options.batch_links_info:
+            links_mass = links_mass[0]
 
         # PE_i = m_i * g^T * p_i => PE = sum_i(m_i * (g . p_i))
         # g is (..., 3), links_pos is (..., n_links, 3) -> broadcast g to (..., 1, 3)
@@ -3305,9 +3465,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             propellers_vgeom_idxs, propellers_revs, propellers_spin, self.dyn_state, self.rigid_info, self.rigid_config
         )
 
-    def set_drone_rpm(self, propellers_link_idx, propellers_rpm, propellers_spin, KF, KM, invert):
+    def set_drone_rpm(self, propellers_link_idx, kf, km, propellers_rpm, propellers_spin, invert):
         kernel_set_drone_rpm(
-            propellers_link_idx, propellers_rpm, propellers_spin, KF, KM, self.dyn_state, self.rigid_config, invert
+            propellers_link_idx, kf, km, propellers_rpm, propellers_spin, self.dyn_state, self.rigid_config, invert
         )
 
     def update_verts_for_geoms(self, geoms_idx):

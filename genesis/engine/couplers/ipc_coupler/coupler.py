@@ -10,7 +10,7 @@ import numpy as np
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.entities.rigid_entity.rigid_link import RHO_MUJOCO, RHO_OBJECT, RHO_ROBOT
+from genesis.engine.entities.rigid_entity.inertial import RHO_MUJOCO, RHO_OBJECT, RHO_ROBOT
 from genesis.engine.materials.FEM.cloth import Cloth
 from genesis.options.solvers import IPCCouplerOptions, RigidOptions
 from genesis.repr_base import RBC
@@ -530,7 +530,7 @@ class IPCCoupler(RBC):
                     if entity.solver._enable_mujoco_compatibility:
                         rho = RHO_MUJOCO
                     else:
-                        rho = RHO_ROBOT if target_link._is_robot else RHO_OBJECT
+                        rho = RHO_ROBOT if target_link.desc.is_robot else RHO_OBJECT
                 self._ipc_abd.apply_to(rigid_link_geom, kappa=ABD_KAPPA * uipc.unit.MPa, mass_density=rho)
 
                 # Apply SoftTransformConstraint and animator for coupled links

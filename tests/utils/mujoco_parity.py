@@ -7,7 +7,7 @@ import pytest
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.misc import qd_to_numpy
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from .assertions import assert_allclose
 
@@ -205,6 +205,43 @@ def init_paired_simulators(gs_sim, mj_sim, qpos=None, qvel=None):
     mujoco.mj_forward(mj_sim.model, mj_sim.data)
 
 
+def set_paired_inertial_properties(gs_sim, mj_sim, *, armature_ratio, mass_ratio, inertia_ratio, com_offset):
+    """Apply the same inertial change to both simulators, through the runtime setters on the Genesis side and through
+    the model fields and 'mj_setConst' on the MuJoCo side.
+
+    Every DOF armature and every body mass and inertia are scaled by the given ratios, and the center of mass of every
+    body MuJoCo compiled with a full mass matrix structure is shifted by 'com_offset' in its body frame. What the setters
+    derive from the change (inverse weights, mean inertia) can then be held against the constants MuJoCo recomputes.
+    """
+    gs_maps, mj_maps = _get_model_mappings(gs_sim, mj_sim)
+    gs_bodies_idx, _, _, gs_dofs_idx, _, _ = gs_maps
+    mj_bodies_idx, _, _, mj_dofs_idx, _, _ = mj_maps
+    model = mj_sim.model
+    # MuJoCo bakes a diagonal mass matrix structure for a body compiled with its inertial frame on the body frame, so a
+    # center of mass shifted at runtime has nowhere to couple: only the bodies compiled with the full structure take one.
+    gs_com_idx, mj_com_idx = [], []
+    for gs_i, mj_i in zip(gs_bodies_idx, mj_bodies_idx):
+        if not model.body_simple[mj_i]:
+            gs_com_idx.append(gs_i)
+            mj_com_idx.append(mj_i)
+
+    model.dof_armature[mj_dofs_idx] *= armature_ratio
+    model.body_mass[mj_bodies_idx] *= mass_ratio
+    model.body_inertia[mj_bodies_idx] *= inertia_ratio
+    model.body_ipos[mj_com_idx] += com_offset
+    # A body compiled with its inertial frame on the body frame keeps the flag that lets MuJoCo skip the offset.
+    model.body_sameframe[mj_com_idx] = mujoco.mjtSameFrame.mjSAMEFRAME_NONE
+    mujoco.mj_setConst(model, mj_sim.data)
+    align_mujoco_invweight0(model)
+
+    solver = gs_sim.rigid_solver
+    solver.set_dofs_armature(armature_ratio * solver.get_dofs_armature(dofs_idx=gs_dofs_idx), dofs_idx=gs_dofs_idx)
+    solver.set_links_mass(mass_ratio * solver.get_links_mass(links_idx=gs_bodies_idx), links_idx=gs_bodies_idx)
+    solver.set_links_inertia(inertia_ratio * solver.get_links_inertia(links_idx=gs_bodies_idx), links_idx=gs_bodies_idx)
+    links_com = tensor_to_array(solver.get_links_COM(links_idx=gs_com_idx)) + com_offset
+    solver.set_links_COM(links_com, links_idx=gs_com_idx)
+
+
 def get_mujoco_midpoint_dofs_mask(mj_sim):
     """Boolean mask over MuJoCo DOFs whose qacc / qvel are overwritten by midpoint integration this step.
 
@@ -249,6 +286,34 @@ def get_mujoco_midpoint_dofs_mask(mj_sim):
         start = 3 if (model.body_ipos[i_b] == 0.0).all() else 0
         mask[adr + start : adr + 6] = True
     return mask
+
+
+def align_mujoco_invweight0(model):
+    """Write into the model the constraint inverse weights of every body and DOF that MuJoCo's general rule gives.
+
+    That rule of 'mj_setConst' is the mean diagonal of J M^-1 J^T at the neutral configuration, over the translational
+    and the rotational rows of a body, and over the DOFs a joint moves together. MuJoCo leaves it aside for a body it
+    flags as simple (see the FIXME in genesis.utils.mjcf), so aligning the model on it has both engines simulate the
+    weights Genesis derives.
+    """
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    mass_mat_inv = np.zeros((model.nv, model.nv))
+    mujoco.mj_solveM(model, data, mass_mat_inv, np.eye(model.nv))
+    jac = np.zeros((6, model.nv))
+    for i_b in range(1, model.nbody):
+        mujoco.mj_jacBodyCom(model, data, jac[:3], jac[3:], i_b)
+        inv_inertia = jac @ mass_mat_inv @ jac.T
+        model.body_invweight0[i_b] = (np.trace(inv_inertia[:3, :3]) / 3.0, np.trace(inv_inertia[3:, 3:]) / 3.0)
+    dofs_invweight = np.diag(mass_mat_inv).copy()
+    for i_j in range(model.njnt):
+        i_d = model.jnt_dofadr[i_j]
+        if model.jnt_type[i_j] == mujoco.mjtJoint.mjJNT_FREE:
+            dofs_invweight[i_d : i_d + 3] = dofs_invweight[i_d : i_d + 3].mean()
+            dofs_invweight[i_d + 3 : i_d + 6] = dofs_invweight[i_d + 3 : i_d + 6].mean()
+        elif model.jnt_type[i_j] == mujoco.mjtJoint.mjJNT_BALL:
+            dofs_invweight[i_d : i_d + 3] = dofs_invweight[i_d : i_d + 3].mean()
+    model.dof_invweight0[:] = dofs_invweight
 
 
 def check_mujoco_model_consistency(
@@ -378,13 +443,17 @@ def check_mujoco_model_consistency(
     mj_dof_dof_frictionloss = mj_sim.model.dof_frictionloss
     assert_allclose(gs_dof_dof_frictionloss[gs_dofs_idx], mj_dof_dof_frictionloss[mj_dofs_idx], tol=tol)
 
-    gs_joint_solparams = np.array([joint.sol_params.cpu() for entity in gs_sim.entities for joint in entity.joints])
+    # Batched joint info carries a leading environment axis, and the MuJoCo model states one value per joint, so
+    # compare the first environment against it.
+    gs_joints_solparams = tensor_to_array(gs_sim.rigid_solver.get_sol_params(joints_idx=slice(None)))
+    gs_joint_solparams = gs_joints_solparams[0] if gs_joints_solparams.ndim == 3 else gs_joints_solparams
     mj_joint_solparams = np.concatenate((mj_sim.model.jnt_solref, mj_sim.model.jnt_solimp), axis=-1)
     _sanitize_sol_params(
         mj_joint_solparams, gs_sim.rigid_solver._sol_min_timeconst, gs_sim.rigid_solver._sol_default_timeconst
     )
     assert_allclose(gs_joint_solparams[gs_joints_idx], mj_joint_solparams[mj_joints_idx], tol=tol)
-    gs_geom_solparams = np.array([geom.sol_params.cpu() for entity in gs_sim.entities for geom in entity.geoms])
+    gs_geoms_solparams = tensor_to_array(gs_sim.rigid_solver.get_sol_params())
+    gs_geom_solparams = gs_geoms_solparams[0] if gs_geoms_solparams.ndim == 3 else gs_geoms_solparams
     mj_geom_solparams = np.concatenate((mj_sim.model.geom_solref, mj_sim.model.geom_solimp), axis=-1)
     # Geom time constants are compared as the model states them: a contact mixes the two geoms' values and the floor is
     # applied to that mix, so flooring per geom here would expect a value neither engine stores.
@@ -397,7 +466,7 @@ def check_mujoco_model_consistency(
     assert_allclose(gs_geom_solparams[gs_geoms_idx], mj_geom_solparams[mj_geoms_idx], tol=tol)
     # FIXME: Masking geometries and equality constraints is not supported for now
     gs_eq_solparams = np.array(
-        [equality.sol_params.cpu() for entity in gs_sim.entities for equality in entity.equalities]
+        [tensor_to_array(equality.get_sol_params()) for entity in gs_sim.entities for equality in entity.equalities]
     ).reshape((-1, 7))
     mj_eq_solparams = np.concatenate((mj_sim.model.eq_solref, mj_sim.model.eq_solimp), axis=-1)
     _sanitize_sol_params(
@@ -461,14 +530,14 @@ def _pair_constraint_rows(gs_sim, mj_sim, gs_dofs_idx, mj_dofs_idx, *, qvel_prev
     gs_n_constraints = gs_sim.rigid_solver.constraint_solver.n_constraints.to_numpy()[0]
     mj_n_constraints = mj_sim.data.nefc
     assert gs_n_constraints == mj_n_constraints
-    gs_n_contacts = gs_sim.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0]
+    gs_n_contacts = gs_sim.rigid_solver.collider.collider_state.n_contacts.to_numpy()[0]
     mj_n_contacts = mj_sim.data.ncon
-    gs_contact_pos = gs_sim.rigid_solver.collider._collider_state.contact_data.pos.to_numpy()[:gs_n_contacts, 0]
+    gs_contact_pos = gs_sim.rigid_solver.collider.collider_state.contact_data.pos.to_numpy()[:gs_n_contacts, 0]
     mj_contact_pos = mj_sim.data.contact.pos
     gs_contact_geoms = np.stack(
         (
-            gs_sim.rigid_solver.collider._collider_state.contact_data.geom_a.to_numpy()[:gs_n_contacts, 0],
-            gs_sim.rigid_solver.collider._collider_state.contact_data.geom_b.to_numpy()[:gs_n_contacts, 0],
+            gs_sim.rigid_solver.collider.collider_state.contact_data.geom_a.to_numpy()[:gs_n_contacts, 0],
+            gs_sim.rigid_solver.collider.collider_state.contact_data.geom_b.to_numpy()[:gs_n_contacts, 0],
         ),
         axis=-1,
     )
@@ -510,7 +579,7 @@ def _pair_constraint_rows(gs_sim, mj_sim, gs_dofs_idx, mj_dofs_idx, *, qvel_prev
     n_head = mj_n_constraints - n_mj_contact_rows - int(is_mj_limit.sum())
     rows_per_contact = n_mj_contact_rows // mj_n_contacts if mj_n_contacts else 0
 
-    gs_contact_sort_idx = gs_sim.rigid_solver.collider._collider_state.contact_sort_idx.to_numpy()[:gs_n_contacts, 0]
+    gs_contact_sort_idx = gs_sim.rigid_solver.collider.collider_state.contact_sort_idx.to_numpy()[:gs_n_contacts, 0]
     gs_block_of_contact = np.empty(gs_n_contacts, dtype=int)
     gs_block_of_contact[gs_contact_sort_idx] = np.arange(gs_n_contacts)
 
@@ -621,7 +690,7 @@ def check_mujoco_data_consistency(
     mj_qfrc_actuator = mj_sim.data.qfrc_actuator
     assert_allclose(gs_qfrc_actuator, mj_qfrc_actuator[mj_dofs_idx], tol=tol)
 
-    gs_n_contacts = gs_sim.rigid_solver.collider._collider_state.n_contacts.to_numpy()[0]
+    gs_n_contacts = gs_sim.rigid_solver.collider.collider_state.n_contacts.to_numpy()[0]
     mj_n_contacts = mj_sim.data.ncon
     assert gs_n_contacts == mj_n_contacts, f"contact count differs: gs={gs_n_contacts} mj={mj_n_contacts}"
     gs_n_constraints = gs_sim.rigid_solver.constraint_solver.n_constraints.to_numpy()[0]
@@ -631,7 +700,7 @@ def check_mujoco_data_consistency(
     efc_atol, qvel_atol = _compute_efc_tolerances(mj_sim, tol)
 
     if gs_n_constraints and not ignore_constraints:
-        gs_contact_pos = gs_sim.rigid_solver.collider._collider_state.contact_data.pos.to_numpy()[:gs_n_contacts, 0]
+        gs_contact_pos = gs_sim.rigid_solver.collider.collider_state.contact_data.pos.to_numpy()[:gs_n_contacts, 0]
         mj_contact_pos = mj_sim.data.contact.pos
         # Sort based on the axis with the largest variation
         max_var_axis = 0
@@ -646,12 +715,12 @@ def check_mujoco_data_consistency(
         gs_sidx = np.argsort(gs_contact_pos[:, max_var_axis])
         mj_sidx = np.argsort(mj_contact_pos[:, max_var_axis])
         assert_allclose(gs_contact_pos[gs_sidx], mj_contact_pos[mj_sidx], tol=tol)
-        gs_contact_normal = gs_sim.rigid_solver.collider._collider_state.contact_data.normal.to_numpy()[
+        gs_contact_normal = gs_sim.rigid_solver.collider.collider_state.contact_data.normal.to_numpy()[
             :gs_n_contacts, 0
         ]
         mj_contact_normal = -mj_sim.data.contact.frame[:, :3]
         assert_allclose(gs_contact_normal[gs_sidx], mj_contact_normal[mj_sidx], tol=tol)
-        gs_penetration = gs_sim.rigid_solver.collider._collider_state.contact_data.penetration.to_numpy()[
+        gs_penetration = gs_sim.rigid_solver.collider.collider_state.contact_data.penetration.to_numpy()[
             :gs_n_contacts, 0
         ]
         mj_penetration = -mj_sim.data.contact.dist
