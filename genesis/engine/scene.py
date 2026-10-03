@@ -9,6 +9,7 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
+from functools import cached_property
 from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
 
 import numpy as np
@@ -111,8 +112,8 @@ def description_digest(desc: SceneDescription) -> str:
     'Scene.load' replaces. Two scenes sharing the digest allocate the same state, so a record of one restores into the
     other. The Genesis version and sources are left out, so a record survives the code moving on.
 
-    The digest exports the description in memory, meshes included, so it is taken once per built scene and once per
-    trajectory opened, never per restore.
+    The digest exports the description in memory, meshes included, so a scene takes it on its first save or restore
+    and keeps it, and a trajectory takes it once when opened.
     """
     defaults = SceneOptions()
     visual = {
@@ -264,7 +265,6 @@ class Scene(RBC):
 
         self._uid = gs.UID()
         self._is_built = False
-        self._desc_digest: str | None = None
         self._pre_step_callbacks: list = []
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
@@ -294,6 +294,9 @@ class Scene(RBC):
             if getattr(self, "_sim", None) is not None:
                 self._sim.destroy()
                 self._sim = None
+
+            # The viewer plugins stopped by the visualizer still require a built scene
+            self._is_built = False
 
     @overload
     def add_entity(
@@ -869,12 +872,16 @@ class Scene(RBC):
             # reset state
             self._reset()
 
-            # The description is fixed once built, so its digest is taken once (see 'description_digest')
-            self._desc_digest = description_digest(self._desc)
             self._is_built = True
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
+            if self._sim.rigid_solver.is_active:
+                try:
+                    self._sim.rigid_solver.check_errno()
+                except gs.GenesisException:
+                    self.destroy()
+                    raise
             self._reset()
 
         # visualizer
@@ -1612,9 +1619,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. If None, the recorded ones stand. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. If None, the recorded ones stand. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. If None, the recorded one stands. Defaults to None.
 
@@ -1637,11 +1644,23 @@ class Scene(RBC):
     ) -> "Scene":
         """Create the scene a description states, waiting to be built.
 
-        The viewer, visualizer and renderer options are replaced where given. The physics options stand as described,
-        since they size the arrays a recorded state fills.
+        The viewer and visualizer options override the described ones field by field, for the fields they set, and the
+        renderer is replaced where given. The physics options stand as described, since they size the arrays a
+        recorded state fills.
         """
-        replaced = (("viewer", viewer_options), ("vis", vis_options), ("renderer", renderer))
-        options = described.options.model_copy(update={name: value for name, value in replaced if value is not None})
+        # A field left at its default keeps the described value, so asking for one change keeps the lights, the
+        # background and the camera the scene was authored with.
+        updates = {}
+        for name, recorded, given in (
+            ("viewer", described.options.viewer, viewer_options),
+            ("vis", described.options.vis, vis_options),
+        ):
+            if given is not None:
+                given_fields = {field: value for field, value in dict(given).items() if field in given.model_fields_set}
+                updates[name] = recorded.model_copy(update=given_fields)
+        if renderer is not None:
+            updates["renderer"] = renderer
+        options = described.options.model_copy(update=updates)
         scene = cls(show_viewer=show_viewer, options=options)
         # 'add_entity' would resolve a material and a surface the description already holds, and read the asset it
         # replaces.
@@ -1698,8 +1717,8 @@ class Scene(RBC):
     ) -> "Scene":
         """Create and build the scene a checkpoint file holds, standing in the final state the file records.
 
-        The file is one written by 'save_checkpoint' or by recording a 'TrajectoryFile' to its end. The viewer,
-        visualizer and renderer options may be replaced (see 'load').
+        The file is one written by 'save_checkpoint' or by recording a 'TrajectoryFile' to its end. The viewer and
+        visualizer options may be overridden and the renderer replaced (see 'load').
 
         Parameters
         ----------
@@ -1708,9 +1727,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. Defaults to None.
 
@@ -1734,8 +1753,8 @@ class Scene(RBC):
     ) -> Trajectory:
         """Open a recorded trajectory in the scene it was recorded from, created and built here, to seek and replay.
 
-        The file is one written by recording a 'TrajectoryFile'. The viewer, visualizer and renderer options may be
-        replaced (see 'load').
+        The file is one written by recording a 'TrajectoryFile'. The viewer and visualizer options may be overridden
+        and the renderer replaced (see 'load').
 
         Parameters
         ----------
@@ -1744,9 +1763,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. Defaults to None.
 
@@ -1935,6 +1954,11 @@ class Scene(RBC):
         scene rather than the state it has simulated to.
         """
         return self._desc
+
+    @cached_property
+    def _desc_digest(self) -> str:
+        """The digest of this scene's description (see 'description_digest'), which a saved state must share."""
+        return description_digest(self._desc)
 
     def get_entity(self, name: str | None = None, *, uid: str | None = None) -> "Entity":
         """

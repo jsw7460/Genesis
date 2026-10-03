@@ -435,6 +435,8 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
     PRESSED_SPOT = (-3.3, 0.8)
     PRESSED_DEPTH = 0.25 * GEOM_SIZE
 
+    asset_path = get_hf_dataset(pattern="meshes/*_hull.obj")
+
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             use_gjk_collision=gjk_collision,
@@ -470,6 +472,27 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
         visualize_contact=True,
         vis_mode="collision",
     )
+    # The lamp spans a meter while the finger presses it by less than a millimeter, so the rounding errors of the
+    # Minkowski difference reach the depth convergence tolerance and cut dents into the polytope that refines the depth.
+    # The finger is placed where the search would end on a dent.
+    finger = scene.add_entity(
+        gs.morphs.Mesh(
+            file=f"{asset_path}/meshes/inspire_finger_hull.obj",
+            pos=(0.2282334562357352, -0.24876064442406798, -3.140536243429785),
+            quat=(0.5830528595970937, 0.23922303491173352, -0.7549261541988322, 0.18140618564379823),
+            decimate=False,
+        ),
+        visualize_contact=True,
+        vis_mode="collision",
+    )
+    lamp = scene.add_entity(
+        gs.morphs.Mesh(
+            file=f"{asset_path}/meshes/floor_lamp_hull.obj",
+            pos=(-0.13053986430168152, -0.09062329679727554, -3.08468234539032),
+            quat=(-0.04015674069523811, 0.15293818712234497, 0.14172174036502838, 0.9771961569786072),
+        ),
+        vis_mode="collision",
+    )
     scene.build()
 
     face_offset = 0.5 * (BOX_SIZE + GEOM_SIZE)
@@ -479,14 +502,23 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
         geom.set_pos(gu.transform_by_quat(pos_local, box.get_quat()) + box.get_pos())
         geom.set_quat(box.get_quat())
 
+    # The exact depth of the hull pair is the distance from the origin to the boundary of their Minkowski difference
+    finger_verts = tensor_to_array(finger.geoms[0].get_verts(), dtype=np.float64)
+    lamp_verts = tensor_to_array(lamp.geoms[0].get_verts(), dtype=np.float64)
+    hull_depth = -ConvexHull((finger_verts[:, None] - lamp_verts).reshape((-1, 3))).equations[:, 3].max()
+
     scene.step()
     contacts = scene.rigid_solver.collider.get_contacts()
-    assert_allclose((contacts["normal"] @ face_normal).abs(), 1.0, tol=tol)
+    is_box = contacts["geom_a"] == box.geoms[0].idx
+    assert_allclose((contacts["normal"][is_box] @ face_normal).abs(), 1.0, tol=tol)
     is_pressed = contacts["geom_b"] == geom_pressed.geoms[0].idx
     assert is_pressed.any()
     assert_allclose(contacts["penetration"][is_pressed], PRESSED_DEPTH, tol=tol)
-    assert (contacts["penetration"][~is_pressed] >= 0.0).all()
-    assert (contacts["penetration"][~is_pressed] <= GEOM_SIZE).all()
+    assert (contacts["penetration"][is_box & ~is_pressed] >= 0.0).all()
+    assert (contacts["penetration"][is_box & ~is_pressed] <= GEOM_SIZE).all()
+    is_lamp = contacts["geom_b"] == lamp.geoms[0].idx
+    assert is_lamp.any()
+    assert_allclose(contacts["penetration"][is_lamp].max(), hull_depth, atol=1e-7)
     offset = (geom_grazing.get_pos() - box.get_pos()) @ face_normal
     assert face_offset - tol <= offset <= face_offset + GEOM_SIZE
 
@@ -1031,25 +1063,35 @@ def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
 
 @pytest.mark.slow("gpu")  # gpu ~250s
 @pytest.mark.parametrize(
-    "scene_kind, max_collision_pairs, max_contacts, error_pattern",
+    "scene_kind, max_collision_pairs, max_contacts, error_pattern, is_raised_by_build",
     [
         # Post-pruning contact budget overflow, with the candidate buffer large enough (2x margin) that it cannot
         # trip first. The automatic budget resolves to 32 contact points per link pair floored at 512, far below
-        # what the piled-up bowls produce.
-        pytest.param("bowls", 1_000, None, "max number of post-pruning contact points", marks=pytest.mark.required),
+        # what the bowls produce once they pile up. Its phase is left unpinned: the coincident bowls put the contact
+        # count of the step taken by the build close to the budget, on either side depending on rounding.
+        pytest.param(
+            "bowls", 1_000, None, "max number of post-pruning contact points", None, marks=pytest.mark.required
+        ),
         # Candidate contact buffer overflow. The explicit contact budget is clamped down to the buffer size, so only
         # the buffer itself can overflow.
-        ("bowls", 150, 1_000, "max number of candidate contact points"),
+        ("bowls", 150, 1_000, "max number of candidate contact points", False),
+        # Broad phase candidate pair overflow on the step taken by the build, the bowls starting fully overlapping.
+        pytest.param(
+            "bowls", 20, None, "max number of broad phase candidate contact pairs", True, marks=pytest.mark.required
+        ),
         # Buffers large enough for the whole pile: no overflow at all. Both values keep a 2x margin over the peaks
         # reached within the stepped window (about 500 colliding geom pairs and 1040 post-pruning contact points).
-        ("bowls", 1_000, 2_000, None),
-        # Two contacts against a budget of one: the clamp must also run when the contact count is below the pruning
-        # gate (n_contacts < 3), in both the serial and the GPU cooperative kernel variants.
-        ("spheres", 150, 1, "max number of post-pruning contact points"),
+        ("bowls", 1_000, 2_000, None, False),
+        # Two contacts against a budget of one, from spheres resting on the plane at build: the clamp must also run
+        # below the pruning gate (n_contacts < 3), in both the serial and the GPU cooperative kernel variants.
+        ("spheres", 150, 1, "max number of post-pruning contact points", True),
     ],
 )
+@pytest.mark.parametrize("use_hibernation", [False, True])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_num_contact_overflow(scene_kind, max_collision_pairs, max_contacts, error_pattern, show_viewer):
+def test_num_contact_overflow(
+    scene_kind, max_collision_pairs, max_contacts, error_pattern, is_raised_by_build, use_hibernation, show_viewer
+):
     from genesis.engine.simulator import RATE_CHECK_ERRNO
 
     N_BOWLS = 4
@@ -1057,6 +1099,7 @@ def test_num_contact_overflow(scene_kind, max_collision_pairs, max_contacts, err
         rigid_options=gs.options.RigidOptions(
             max_collision_pairs=max_collision_pairs,
             max_contacts=max_contacts,
+            use_hibernation=use_hibernation,
         ),
         renderer=gs.renderers.Rasterizer(),
         show_viewer=show_viewer,
@@ -1093,30 +1136,32 @@ def test_num_contact_overflow(scene_kind, max_collision_pairs, max_contacts, err
                     radius=0.1,
                 ),
             )
-    scene.build()
-    assert scene.rigid_solver.collider.collider_config.has_prunable_contacts
 
-    # The resolved contact budget must match the documented resolution: 32 contact points per link pair floored at
-    # 512 when automatic (every link pair here has more than 32 candidate contact points), the explicit value clamped
-    # to the candidate buffer size otherwise. The constraint buffers are sized accordingly, with 4 constraint rows
-    # per contact point (all joints are free so there is no joint-limit term).
-    solver = scene.rigid_solver
-    collider_info = solver.collider.collider_info
-    if max_contacts is None:
-        n_link_pairs = (N_BOWLS + 1) * N_BOWLS // 2
-        expected_max_contacts = max(32 * n_link_pairs, 512)
-    else:
-        expected_max_contacts = min(max_contacts, int(collider_info.max_candidate_contacts[None]))
-    assert int(collider_info.max_contacts[None]) == expected_max_contacts
-    expected_len_constraints = 4 * expected_max_contacts + solver.n_dofs + 6 * solver.n_candidate_equalities_
-    assert solver.constraint_solver.len_constraints == expected_len_constraints
-
-    # All overflows occur on the very first step (the bowls start fully overlapping, the spheres start resting on the
-    # plane), but errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee
-    # that the error gets raised.
     with nullcontext() if error_pattern is None else pytest.raises(gs.GenesisException, match=error_pattern):
+        scene.build()
+        assert scene.rigid_solver.collider.collider_config.has_prunable_contacts
+
+        # Contact budget as documented for 'RigidOptions.max_contacts' (32 contact points per link pair floored at 512),
+        # each contact point taking 4 constraint rows under the default pyramidal friction cone.
+        solver = scene.rigid_solver
+        collider_info = solver.collider.collider_info
+        if max_contacts is None:
+            n_link_pairs = (N_BOWLS + 1) * N_BOWLS // 2
+            expected_max_contacts = max(32 * n_link_pairs, 512)
+        else:
+            expected_max_contacts = min(max_contacts, int(collider_info.max_candidate_contacts[None]))
+        assert int(collider_info.max_contacts[None]) == expected_max_contacts
+        expected_len_constraints = 4 * expected_max_contacts + solver.n_dofs + 6 * solver.n_candidate_equalities_
+        assert solver.constraint_solver.len_constraints == expected_len_constraints
+
+        # errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee that an
+        # error triggered by the first steps gets raised.
         for _ in range(RATE_CHECK_ERRNO + 1):
             scene.step()
+
+    # An error raised by the build leaves the scene destroyed, one raised by a step leaves it built.
+    if is_raised_by_build is not None:
+        assert scene.is_built is not is_raised_by_build
 
 
 @pytest.mark.slow  # ~200s

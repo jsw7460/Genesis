@@ -10,16 +10,17 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
+import genesis.utils.simt as su
 
 
 @qd.func
 def func_refine_smooth_contact_pos(
-    geom_type,
-    geom_data,
+    geom_type: int,
+    geom_data: qd.types.vector(7),
     geom_pos: qd.types.vector(3),
     geom_quat: qd.types.vector(4),
     normal: qd.types.vector(3),
-    penetration,
+    penetration: float,
     ccd_contact_pos: qd.types.vector(3),
 ):
     """
@@ -89,10 +90,10 @@ def func_refine_smooth_contact_pos(
 
 @qd.func
 def func_apply_smooth_refinement(
-    i_ga,
-    i_gb,
+    i_ga: int,
+    i_gb: int,
     normal: qd.types.vector(3),
-    penetration,
+    penetration: float,
     contact_pos: qd.types.vector(3),
     ga_pos: qd.types.vector(3),
     ga_quat: qd.types.vector(4),
@@ -138,7 +139,7 @@ def func_apply_smooth_refinement(
 
 
 @qd.func
-def rotaxis(vecin, i0, i1, i2, f0, f1, f2):
+def rotaxis(i0: int, i1: int, i2: int, vecin: qd.types.vector(3), f0: int, f1: int, f2: int):
     vecres = qd.Vector([0.0, 0.0, 0.0], dt=gs.qd_float)
     vecres[0] = vecin[i0] * f0
     vecres[1] = vecin[i1] * f1
@@ -147,7 +148,7 @@ def rotaxis(vecin, i0, i1, i2, f0, f1, f2):
 
 
 @qd.func
-def rotmatx(matin, i0, i1, i2, f0, f1, f2):
+def rotmatx(i0: int, i1: int, i2: int, matin: qd.types.matrix(3, 3), f0: int, f1: int, f2: int):
     matres = qd.Matrix.zero(gs.qd_float, 3, 3)
     matres[0, :] = matin[i0, :] * f0
     matres[1, :] = matin[i1, :] * f1
@@ -160,10 +161,9 @@ def collider_kernel_reset(
     envs_idx: qd.types.ndarray(),
     collider_state: array_class.ColliderState,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
     cache_only: qd.template(),
 ):
-    max_possible_pairs = collider_state.contact_cache.normal.shape[0]
-
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
@@ -171,14 +171,16 @@ def collider_kernel_reset(
         if qd.static(not cache_only):
             collider_state.first_time[i_b] = True
 
-        for i_pair in range(max_possible_pairs):
-            collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+        # The contact cache is only held for the convex-convex pairs (see get_contact_cache in array_class.py)
+        if qd.static(collider_static_config.has_non_box_plane_convex_convex):
+            for i_pair in range(collider_state.contact_cache.normal.shape[0]):
+                collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
 
 
 @qd.func
 def func_collider_clear_env(
-    i_b,
+    i_b: int,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
@@ -263,7 +265,7 @@ def func_collider_clear_env(
 
 
 @qd.func
-def func_promote_woken_contacts(i_b, dyn_state: array_class.DynState, collider_state: array_class.ColliderState):
+def func_promote_woken_contacts(i_b: int, dyn_state: array_class.DynState, collider_state: array_class.ColliderState):
     """Move the kept contacts of the links of env i_b that woke this step among the live contacts.
 
     A kept contact holds where its sleeper rests, and the narrowphase left the sleeper's pairs out while it slept, so
@@ -313,6 +315,7 @@ def kernel_masked_collider_clear(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(envs_mask.shape[0]):
         if envs_mask[i_b]:
             func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
@@ -362,13 +365,13 @@ def collider_kernel_get_contacts(
 
 @qd.func
 def func_add_contact(
-    i_ga,
-    i_gb,
-    i_b,
-    i_pair,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_pair: int,
     normal: qd.types.vector(3),
     contact_pos: qd.types.vector(3),
-    penetration,
+    penetration: float,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
@@ -408,14 +411,14 @@ def func_add_contact(
 
 @qd.func
 def func_set_contact(
-    i_ga,
-    i_gb,
-    i_b,
-    i_c,
-    i_pair,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_c: int,
+    i_pair: int,
     normal: qd.types.vector(3),
     contact_pos: qd.types.vector(3),
-    penetration,
+    penetration: float,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
@@ -464,10 +467,10 @@ def func_set_contact(
 
 @qd.func
 def func_add_diff_contact_input(
-    i_ga,
-    i_gb,
-    i_b,
-    i_d,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_d: int,
     collider_state: array_class.ColliderState,
     gjk_state: array_class.GJKState,
     collider_info: array_class.ColliderInfo,
@@ -492,7 +495,7 @@ def func_add_diff_contact_input(
 
 
 @qd.func
-def func_compute_geom_rbound(i_g, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo):
+def func_compute_geom_rbound(i_g: int, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo):
     """Compute the bounding sphere radius for a geom, matching MuJoCo's geom_rbound."""
     geom_type = dyn_info.geoms.type[i_g]
     rbound = gs.qd_float(0.0)
@@ -516,7 +519,9 @@ def func_compute_geom_rbound(i_g, geoms_init_AABB: array_class.GeomsInitAABB, dy
 
 
 @qd.func
-def func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo):
+def func_compute_geom_pair_scale(
+    i_ga: int, i_gb: int, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo
+):
     # Intrinsic length scale of a geom pair: half the smaller geom's world-aligned bounding-box diagonal. The
     # original (rest-pose) AABB is used so the scale is a constant independent of the current orientation, which
     # makes sense since the size of the geometries is an intrinsic property. Multiply by a relative tolerance to
@@ -532,7 +537,7 @@ def func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB: array_class.GeomsI
 
 @qd.func
 def func_compute_geom_pair_scale_mj(
-    i_ga, i_gb, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo
+    i_ga: int, i_gb: int, geoms_init_AABB: array_class.GeomsInitAABB, dyn_info: array_class.DynInfo
 ):
     """Geom-pair length scale matching MuJoCo's formula: min(rbound_g1, rbound_g2). Multiply by a relative tolerance
     to recover MuJoCo's absolute tolerance."""
@@ -543,8 +548,8 @@ def func_compute_geom_pair_scale_mj(
 
 @qd.func
 def func_compute_mc_tolerance(
-    i_ga,
-    i_gb,
+    i_ga: int,
+    i_gb: int,
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_info: array_class.DynInfo,
     collider_info: array_class.ColliderInfo,
@@ -563,9 +568,9 @@ def func_compute_mc_tolerance(
 
 @qd.func
 def func_contact_orthogonals(
-    i_ga,
-    i_gb,
-    i_b,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
     normal: qd.types.vector(3),
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
@@ -648,7 +653,7 @@ def func_contact_order_key(pos: qd.types.vector(3)):
     return pos[0] + 1.618033988749895 * pos[1] + 2.618033988749895 * pos[2]
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def func_clamp_prune_contacts(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -661,7 +666,7 @@ def func_clamp_prune_contacts(
     """Clamp + (optional) link-pair pruning, in one per-env loop pass.
 
     Builds a logical-to-physical contact permutation in contact_sort_idx rather than rewriting contact_data. After this
-    kernel runs, downstream consumers read contact i_col by indirecting through
+    func runs, downstream consumers read contact i_col by indirecting through
     contact_data.X[contact_sort_idx[i_col, i_b], i_b]. The physical layout of contact_data is left intact.
 
     Phases per env (gated at compile time by collider_static_config):
@@ -1077,7 +1082,7 @@ def func_clamp_prune_contacts(
             errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CONTACTS
 
 
-@qd.kernel(fastcache=True)
+@qd.func
 def func_clamp_prune_contacts_coop(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -1088,9 +1093,10 @@ def func_clamp_prune_contacts_coop(
     """GPU-only cooperative warp-per-env variant of func_clamp_prune_contacts.
 
     Only dispatched when pruning is enabled, so it prunes unconditionally (no static gate). Same clamp + prune
-    algorithm and same contract (mandatory clamp + identity-init contact_sort_idx + phase-3 compact) as the serial
-    fused kernel; deterministic ordering of the kept contacts is applied later in add_inequality_constraints.
-    Difference from the serial kernel: 32 warp lanes split the per-env work:
+    algorithm and same contract (mandatory clamp + identity-init contact_sort_idx + phase-3 compact) as
+    func_clamp_prune_contacts. Deterministic ordering of the kept contacts is applied later in
+    add_inequality_constraints.
+    Difference from func_clamp_prune_contacts: 32 warp lanes split the per-env work:
       - PARALLEL: per-contact init, phase-2 mean-normal / centroid reductions, coplanarity reduction, in-plane
         projection writes, phase-1a bitonic sort (when n_con <= 32; falls back to serial insertion sort otherwise).
       - SERIAL on lane 0: bucket walk control, lex sort, Andrew's monotone chain, hull-mark, deep-pen restore, and
@@ -1128,7 +1134,7 @@ def func_clamp_prune_contacts_coop(
             i_c_ += _K
 
         if n_con - n_hib >= 3:
-            # PARALLEL: phase 1a key init, 32 lanes stride over the live contacts (see the serial kernel).
+            # PARALLEL: phase 1a key init, 32 lanes stride over the live contacts (see func_clamp_prune_contacts).
             # contact_sort_idx identity was already written in the unconditional init block above so the phase-1a
             # sort can read+sort it in place.
             i_c_ = n_hib + tid
@@ -1280,15 +1286,15 @@ def func_clamp_prune_contacts_coop(
                         centroid_z_l += pos_c[2]
                         i_cb_ += _K
 
-                    mean_normal_x = qd.simt.subgroup.reduce_all_add_tiled(mean_normal_x_l, 5)
-                    mean_normal_y = qd.simt.subgroup.reduce_all_add_tiled(mean_normal_y_l, 5)
-                    mean_normal_z = qd.simt.subgroup.reduce_all_add_tiled(mean_normal_z_l, 5)
-                    centroid_x = qd.simt.subgroup.reduce_all_add_tiled(centroid_x_l, 5)
-                    centroid_y = qd.simt.subgroup.reduce_all_add_tiled(centroid_y_l, 5)
-                    centroid_z = qd.simt.subgroup.reduce_all_add_tiled(centroid_z_l, 5)
+                    mean_normal_x = su.qd_block_sum(mean_normal_x_l)
+                    mean_normal_y = su.qd_block_sum(mean_normal_y_l)
+                    mean_normal_z = su.qd_block_sum(mean_normal_z_l)
+                    centroid_x = su.qd_block_sum(centroid_x_l)
+                    centroid_y = su.qd_block_sum(centroid_y_l)
+                    centroid_z = su.qd_block_sum(centroid_z_l)
 
-                    # POST-REDUCE math runs on all 32 lanes (deterministic, cheap; redundant arithmetic is free vs.
-                    # broadcasting the reduce results).
+                    # Every lane holds the sums lane 0 does (see qd_block_sum in utils/simt.py), so the post-reduce math
+                    # runs on all 32 lanes and agrees bit for bit across them.
                     inv_n_cb = gs.qd_float(1.0) / qd.cast(n_cb, gs.qd_float)
                     centroid_x *= inv_n_cb
                     centroid_y *= inv_n_cb
@@ -1326,8 +1332,8 @@ def func_clamp_prune_contacts_coop(
                                 max_radius_sq_l = radius_sq
                             i_cb_ += _K
 
-                        max_depth = qd.simt.subgroup.reduce_all_max_tiled(max_depth_l, 5)
-                        max_in_plane_r2 = qd.simt.subgroup.reduce_all_max_tiled(max_radius_sq_l, 5)
+                        max_depth = su.qd_block_max(max_depth_l)
+                        max_in_plane_r2 = su.qd_block_max(max_radius_sq_l)
 
                         if max_depth > tol * qd.sqrt(max_in_plane_r2):
                             coplanar = False
@@ -1467,7 +1473,7 @@ def func_clamp_prune_contacts_coop(
                             i_pc = collider_state.contact_sort_idx[i_hv, i_b]
                             collider_state.contact_keep[i_pc, i_b] = 1
 
-                        # Lane-0 deep-penetration restore. See serial kernel for the rationale. Indices here live in
+                        # Lane-0 deep-penetration restore. See func_clamp_prune_contacts for the rationale. Indices here live in
                         # orig-space because the cycle-permute is fused into phase 3 below (contact_data is still in
                         # pre-sort order, so we translate sort-space hull/bucket indices through contact_sort_idx).
                         hull_pen_max = gs.qd_float(0.0)
@@ -1518,7 +1524,12 @@ def func_set_upstream_grad(
     _B = dL_dposition.shape[0]
     _C = dL_dposition.shape[1]
     for i_b, i_c in qd.ndrange(_B, _C):
+        # The upstream gradients follow the logical order of the contacts that get_contacts returns, which
+        # contact_sort_idx maps to the physical slots of contact_data.
+        i_col = i_c
+        if i_c < collider_state.n_contacts[i_b]:
+            i_col = collider_state.contact_sort_idx[i_c, i_b]
         for j in qd.static(range(3)):
-            collider_state.contact_data.pos.grad[i_c, i_b][j] = dL_dposition[i_b, i_c, j]
-            collider_state.contact_data.normal.grad[i_c, i_b][j] = dL_dnormal[i_b, i_c, j]
-        collider_state.contact_data.penetration.grad[i_c, i_b] = dL_dpenetration[i_b, i_c]
+            collider_state.contact_data.pos.grad[i_col, i_b][j] = dL_dposition[i_b, i_c, j]
+            collider_state.contact_data.normal.grad[i_col, i_b][j] = dL_dnormal[i_b, i_c, j]
+        collider_state.contact_data.penetration.grad[i_col, i_b] = dL_dpenetration[i_b, i_c]

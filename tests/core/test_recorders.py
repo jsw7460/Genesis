@@ -220,15 +220,23 @@ def test_file_writers(tmp_path):
     csv_writer = gs.recorders.CSVFile(filename=csv_file, header=("in_contact",))
     contact_sensor.start_recording(csv_writer)
 
+    imu = scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=box.idx,
+        ),
+    )
+    imu_file = tmp_path / "imu_data.csv"
+    imu.start_recording(gs.recorders.CSVFile(filename=imu_file))
+
     csv_array_file = tmp_path / "array_data.csv"
     scene.add_recorder(
-        data_func=lambda: {"batch": np.arange(6).reshape(2, 3)},
+        data_func=lambda: {"batch": np.arange(6).reshape(2, 3), "scale": np.float32(0.5)},
         rec_options=gs.recorders.CSVFile(filename=csv_array_file),
     )
 
     npz_file = tmp_path / "scene_data.npz"
     scene.add_recorder(
-        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1},
+        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1, "scale": np.float32(0.5)},
         rec_options=gs.recorders.NPZFile(filename=npz_file),
     )
 
@@ -254,19 +262,25 @@ def test_file_writers(tmp_path):
         assert rows[1][1] in ("False", "0")  # not in contact initially
         assert rows[-1][1] in ("True", "1")  # in contact after falling
 
+    with open(imu_file, "r") as f:
+        rows = list(csv.reader(f))
+        assert len(rows) == STEPS + 2
+        assert rows[0] == ["timestamp", *(f"{name}_{i}" for name in ("lin_acc", "ang_vel", "mag") for i in range(3))]
+
     assert csv_array_file.exists()
     with open(csv_array_file, "r") as f:
         reader = csv.reader(f)
         rows = list(reader)
 
-        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5"]
-        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5"]
+        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5", "scale"]
+        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5", "0.5"]
 
     assert npz_file.exists()
     data = np.load(npz_file)
     assert "timestamp" in data
     assert "box_pos" in data
     assert "dummy" in data
+    assert_allclose(data["scale"], 0.5, tol=gs.EPS)
     assert len(data["timestamp"]) == STEPS + 1
 
 
