@@ -574,6 +574,16 @@ def torch_compile(*, elems_ndim: tuple[int, ...]) -> Callable[[Callable], Callab
             # Broadcasting is rare enough for its slow shape inference to be worth skipping when all shapes agree
             if any(shape != batch_shape for shape in batch_shapes[1:]):
                 batch_shape = torch.broadcast_shapes(*batch_shapes)
+            if torch.compiler.is_compiling():
+                # Inside an enclosing torch.compile region the enclosing graph fuses the arithmetic itself, and
+                # Dynamo traces the function body in place of the support probe and the nested compiled function,
+                # which it treats as opaque. The body reads its elements along the last `elems_ndim[i]` dimensions,
+                # so the batch dimensions only need broadcasting.
+                tensors = tuple(
+                    tensor if tensor is None else tensor.expand((*batch_shape, *tensor.shape[tensor.ndim - n :]))
+                    for tensor, n in zip(tensors, elems_ndim)
+                )
+                return fn(*tensors, *args, **kwargs)
             n_elems = math.prod(batch_shape)
             device_type = next(tensor for tensor in tensors if tensor is not None).device.type
             is_compiled = _is_torch_compile_supported(device_type)

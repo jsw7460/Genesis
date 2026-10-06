@@ -343,6 +343,36 @@ def test_slerp(batch_shape, tol):
 
 
 @pytest.mark.required
+def test_geom_torch_functions_inside_torch_compile():
+    batch_shape = (6, 5)
+    xyz = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
+    quat = gu.xyz_to_quat(xyz)
+    other = gu.xyz_to_quat(torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device))
+    vec = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
+    ratio = torch.rand(batch_shape, dtype=gs.tc_float, device=gs.device)
+
+    def fn(xyz, quat, other, vec, ratio):
+        return (
+            gu.xyz_to_quat(xyz),
+            gu.quat_to_R(quat),
+            gu.quat_to_xyz(quat),
+            gu.R_to_quat(gu.quat_to_R(quat)),
+            gu.transform_quat_by_quat(quat, other),
+            gu.transform_by_quat(vec, quat),
+            gu.inv_transform_by_quat(vec[0, 0], quat),
+            gu.transform_by_quat(vec, gu.inv_quat(quat[0, 0])),
+            gu.slerp(quat, other, ratio),
+            gu.z_up_to_R(vec, torch.tensor((0.0, 1.0, 0.0), dtype=gs.tc_float, device=gs.device)),
+        )
+
+    expected = fn(xyz, quat, other, vec, ratio)
+    compiled = torch.compile(fn, fullgraph=True)(xyz, quat, other, vec, ratio)
+    for value_true, value in zip(expected, compiled):
+        assert value.shape == value_true.shape
+        assert_allclose(value, value_true, tol=1e2 * gs.EPS)
+
+
+@pytest.mark.required
 def test_compose_inertial_properties():
     mass1, com1 = 1.0, np.array([1.0, 0.0, 0.0])
     inertia1 = np.array([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
