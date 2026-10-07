@@ -18,7 +18,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils import warnings as warnings_mod
 from genesis.utils.image_exporter import as_grayscale_image
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import _is_torch_compile_supported, tensor_to_array
 from genesis.utils.tools import FPSTracker
 from genesis.utils.urdf import compose_inertial_properties
 from genesis.utils.warnings import warn_once
@@ -344,6 +344,8 @@ def test_slerp(batch_shape, tol):
 
 @pytest.mark.required
 def test_geom_torch_functions_inside_torch_compile():
+    if not _is_torch_compile_supported(gs.device.type):
+        pytest.skip("TorchInductor cannot build kernels for this device on this host")
     batch_shape = (6, 5)
     xyz = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
     quat = gu.xyz_to_quat(xyz)
