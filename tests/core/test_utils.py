@@ -343,35 +343,50 @@ def test_slerp(batch_shape, tol):
 
 
 @pytest.mark.required
-def test_geom_torch_functions_inside_torch_compile():
-    if not _is_torch_compile_supported(gs.device.type):
+@pytest.mark.parametrize("torch_backend", ["eager", "inductor"])
+def test_geom_torch_functions_inside_enclosing_torch_compile(torch_backend, tol):
+    if torch_backend == "inductor" and not _is_torch_compile_supported(gs.device.type):
         pytest.skip("TorchInductor cannot build kernels for this device on this host")
-    batch_shape = (6, 5)
-    xyz = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
-    quat = gu.xyz_to_quat(xyz)
-    other = gu.xyz_to_quat(torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device))
-    vec = torch.randn((*batch_shape, 3), dtype=gs.tc_float, device=gs.device)
-    ratio = torch.rand(batch_shape, dtype=gs.tc_float, device=gs.device)
 
-    def fn(xyz, quat, other, vec, ratio):
+    def inputs(n_a, n_b):
+        # One quaternion, batches of quaternions and vectors, a batch of ratios: the shapes a caller hands in, plus a
+        # non-contiguous batch (transposed), a broadcast pair (n_a, 1) x (1, n_b), and a single element against a batch.
+        return (
+            torch.randn((n_a, n_b, 3), dtype=gs.tc_float, device=gs.device),
+            gu.xyz_to_quat(torch.randn((n_a, n_b, 3), dtype=gs.tc_float, device=gs.device)),
+            gu.xyz_to_quat(torch.randn((n_a, n_b, 3), dtype=gs.tc_float, device=gs.device)),
+            torch.randn((n_b, n_a, 3), dtype=gs.tc_float, device=gs.device).transpose(0, 1),
+            torch.randn((n_a, 1, 3), dtype=gs.tc_float, device=gs.device),
+            gu.xyz_to_quat(torch.randn((1, n_b, 3), dtype=gs.tc_float, device=gs.device)),
+            torch.rand((n_a, n_b), dtype=gs.tc_float, device=gs.device),
+        )
+
+    def fn(xyz, quat, other, vec_strided, vec_col, quat_row, ratio):
         return (
             gu.xyz_to_quat(xyz),
             gu.quat_to_R(quat),
-            gu.quat_to_xyz(quat),
+            gu.quat_to_xyz(quat, rpy=True),
             gu.R_to_quat(gu.quat_to_R(quat)),
             gu.transform_quat_by_quat(quat, other),
-            gu.transform_by_quat(vec, quat),
-            gu.inv_transform_by_quat(vec[0, 0], quat),
-            gu.transform_by_quat(vec, gu.inv_quat(quat[0, 0])),
+            gu.transform_by_quat(vec_strided, quat),
+            gu.inv_transform_by_quat(vec_col, quat_row),
+            gu.transform_by_quat(vec_col[0, 0], gu.inv_quat(quat)),
+            gu.quat_to_R(quat[0, 0]),
+            gu.transform_by_quat(vec_col[:1, 0], quat[:1, 0]),
             gu.slerp(quat, other, ratio),
-            gu.z_up_to_R(vec, torch.tensor((0.0, 1.0, 0.0), dtype=gs.tc_float, device=gs.device)),
+            gu.z_up_to_R(vec_strided, None),
+            gu.z_up_to_R(vec_strided, vec_col[0, 0]),
         )
 
-    expected = fn(xyz, quat, other, vec, ratio)
-    compiled = torch.compile(fn, fullgraph=True)(xyz, quat, other, vec, ratio)
-    for value_true, value in zip(expected, compiled):
-        assert value.shape == value_true.shape
-        assert_allclose(value, value_true, tol=1e2 * gs.EPS)
+    fn_compiled = torch.compile(fn, fullgraph=True, backend=torch_backend)
+    # A second batch size makes the enclosing graph recompile with dynamic shapes
+    for n_a, n_b in ((6, 5), (3, 2)):
+        args = inputs(n_a, n_b)
+        # Inputs requiring gradient run the functions eagerly, on the function body itself: the reference
+        expected = fn(*(arg.detach().requires_grad_() for arg in args))
+        for value_true, value in zip(expected, fn_compiled(*args)):
+            assert value.shape == value_true.shape
+            assert_allclose(value, value_true.detach(), tol=tol)
 
 
 @pytest.mark.required
